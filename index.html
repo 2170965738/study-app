@@ -14,7 +14,6 @@
     <button data-tab="courses">课表</button>
     <button data-tab="tasks">任务</button>
     <button data-tab="fitness">健身</button>
-    <button data-tab="data">数据</button>
   </nav>
   <div class="auth-area">
     <button id="auth-btn" class="auth-btn" type="button">登录 / 注册</button>
@@ -245,32 +244,6 @@
       </div>
     </div>
   </section>
-
-  <!-- 数据 -->
-  <section id="page-data" class="page">
-    <div class="hero">
-      <h1>数据管理</h1>
-      <p class="hero-sub">本地保存 · 导入导出</p>
-    </div>
-
-    <div class="big-card">
-      <div class="block first">
-        <h2>本地数据</h2>
-        <p class="muted">所有数据保存在当前浏览器的 localStorage 中，刷新不丢；换浏览器或清理缓存会丢失。</p>
-        <p id="data-stat" class="muted"></p>
-        <div class="row-gap">
-          <button id="btn-export" class="btn">导出数据</button>
-          <button id="btn-import" class="btn ghost">导入数据</button>
-          <button id="btn-clear" class="btn danger">清空全部数据</button>
-        </div>
-        <input type="file" id="import-file" accept=".json,application/json" class="hidden">
-        <p id="data-msg" class="muted"></p>
-      </div>
-      <div class="block">
-        <p class="muted">导出会下载一个 JSON 文件；在另一台设备点「导入数据」选择该文件即可覆盖同步（导入前会再次确认）。</p>
-      </div>
-    </div>
-  </section>
 </main>
 
 <!-- 沉浸式专注计时器 -->
@@ -302,7 +275,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20261105c"></script>
+<script src="app.js?v=20261105e"></script>
 <script>
 /* 仅做展示：学习进度条 + 任务优先级装饰色（只读取 localStorage，不修改数据） */
 (function () {

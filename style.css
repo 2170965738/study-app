@@ -247,8 +247,6 @@ input[type="date"], input[type="time"] { font-variant-numeric: tabular-nums; }
 .btn:active { transform: none; opacity: .72; box-shadow: none; }
 .btn.ghost { background: var(--mint); color: #35594a; box-shadow: 0 6px 18px rgba(123, 208, 175, .25); }
 .btn.ghost:hover { background: #c8f1e1; }
-.btn.danger { background: var(--coral); color: #7c414e; box-shadow: 0 6px 18px rgba(233, 160, 178, .25); }
-.btn.danger:hover { background: #ffd2dc; }
 .btn.small { padding: 6px 13px; font-size: 12.5px; }
 
 .row-gap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }

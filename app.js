@@ -113,7 +113,8 @@ function load() {
 }
 let state = load();
 
-/* ===== 云端同步（任务 / 课表） ===== */
+/* ===== 云端同步（任务 / 课表 / 健身） ===== */
+const FIT_OWNER_KEY = 'studyhub.fitnessOwner'; // 记住本机健身数据属于哪个账号，防止串号上传
 const cloud = {
   client: null,
   user: null,
@@ -122,7 +123,8 @@ const cloud = {
   pendingPush: false,
   pushTimer: 0,
   pullTimer: 0,
-  pullPending: false
+  pullPending: false,
+  fitnessWarned: false
 };
 
 let toastTimer = 0;
@@ -209,6 +211,35 @@ function rowToCourse(r) {
   };
 }
 
+/* 健身按「用户 + 日期」存一行，日期就是主键的一部分 */
+function fitnessToRow(date, rec, uid) {
+  rec = rec || {};
+  return {
+    user_id: uid,
+    workout_date: date,
+    type: rec.type || '',
+    duration: Math.max(0, Math.round(Number(rec.duration) || 0)),
+    done: !!rec.done,
+    note: rec.note || ''
+  };
+}
+function rowToFitness(r) {
+  return {
+    date: String(r.workout_date || '').slice(0, 10),
+    type: r.type || '',
+    duration: Number(r.duration) || 0,
+    done: !!r.done,
+    note: r.note || ''
+  };
+}
+// 对象键顺序不稳定，用排序后的指纹比较健身数据是否有变化
+function workoutsSig(w) {
+  return Object.keys(w || {}).sort().map(d => {
+    const r = w[d] || {};
+    return [d, r.type || '', Number(r.duration) || 0, r.done ? 1 : 0, r.note || ''].join('|');
+  }).join('\n');
+}
+
 function saveLocal() {
   try { localStorage.setItem(KEY, JSON.stringify(state)); }
   catch (e) { console.warn('保存失败', e); }
@@ -262,10 +293,20 @@ async function pushCloud() {
   const uid = cloud.user.id;
   let taskRows = [];
   let courseRows = [];
+  let fitnessRows = [];
+  const fitOwner = localStorage.getItem(FIT_OWNER_KEY);
+  const canSyncFitness = !fitOwner || fitOwner === uid; // 换账号后先等 pull 替换本机数据
   try {
     taskRows = state.tasks.map(t => taskToRow(t, uid));
     courseRows = state.courses.map(c => courseToRow(c, uid));
-    console.info('[sync] push', { uid, tasks: taskRows.length, courses: courseRows.length });
+    if (canSyncFitness) {
+      fitnessRows = Object.keys(state.workouts)
+        .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)) // 只同步合法日期，避免脏键导致整批失败
+        .map(d => fitnessToRow(d, state.workouts[d], uid));
+    }
+    console.info('[sync] push', {
+      uid, tasks: taskRows.length, courses: courseRows.length, fitness: fitnessRows.length
+    });
 
     if (taskRows.length) {
       const { error } = await cloud.client.from('tasks').upsert(taskRows, { onConflict: 'id' });
@@ -274,6 +315,23 @@ async function pushCloud() {
     if (courseRows.length) {
       const { error } = await cloud.client.from('courses').upsert(courseRows, { onConflict: 'id' });
       if (error) throw error;
+    }
+
+    // 健身记录只 upsert，不删除云端旧行（本模块没有删除入口，避免旧设备误删另一端的新打卡）
+    if (fitnessRows.length) {
+      try {
+        const { error } = await cloud.client.from('fitness')
+          .upsert(fitnessRows, { onConflict: 'user_id,workout_date' });
+        if (error) throw error;
+        localStorage.setItem(FIT_OWNER_KEY, uid);
+        cloud.fitnessWarned = false;
+      } catch (fitErr) {
+        console.error('[sync] fitness push failed', fitErr);
+        if (!cloud.fitnessWarned) {
+          cloud.fitnessWarned = true;
+          syncError('健身数据同步失败：' + (fitErr.message || '请先执行 fitness 建表 SQL'));
+        }
+      }
     }
 
     const [tRes, cRes] = await Promise.all([
@@ -316,15 +374,33 @@ async function pullCloud(forceRender) {
   if (!cloud.client || !cloud.user) return;
   const uid = cloud.user.id;
   try {
-    const [tRes, cRes] = await Promise.all([
+    const [tRes, cRes, fRes] = await Promise.all([
       cloud.client.from('tasks').select('*').eq('user_id', uid).order('created_at', { ascending: true }),
-      cloud.client.from('courses').select('*').eq('user_id', uid).order('created_at', { ascending: true })
+      cloud.client.from('courses').select('*').eq('user_id', uid).order('created_at', { ascending: true }),
+      cloud.client.from('fitness').select('*').eq('user_id', uid).order('workout_date', { ascending: true })
     ]);
     if (tRes.error) throw tRes.error;
     if (cRes.error) throw cRes.error;
 
+    // 健身表缺失 / RLS 未配置时，只提示健身，不拖垮任务和课表的同步
+    const fitnessOk = !fRes.error;
+    if (!fitnessOk) {
+      console.warn('[sync] fitness pull failed', fRes.error);
+      if (!cloud.fitnessWarned) {
+        cloud.fitnessWarned = true;
+        syncError('健身数据读取失败：' + (fRes.error.message || '请检查 fitness 表和 RLS 策略'));
+      }
+    } else {
+      cloud.fitnessWarned = false;
+    }
+
     const cloudTasks = (tRes.data || []).map(rowToTask);
     const cloudCourses = (cRes.data || []).map(rowToCourse);
+    const cloudWorkouts = {};
+    (fRes.data || []).forEach(r => {
+      const w = rowToFitness(r);
+      if (w.date) cloudWorkouts[w.date] = w;
+    });
     const cloudEmpty = !cloudTasks.length && !cloudCourses.length;
     const localHas = state.tasks.length > 0 || state.courses.length > 0;
     const migratedKey = 'studyhub.migrated.' + uid;
@@ -343,13 +419,32 @@ async function pullCloud(forceRender) {
       return t;
     });
 
+    // 健身：同账号合并本机独有记录（首次上线会自动补传）；换账号时以云端为准，避免串号
+    let mergedWorkouts = state.workouts;
+    let needFitPush = false;
+    if (fitnessOk) {
+      const owner = localStorage.getItem(FIT_OWNER_KEY);
+      const sameAccount = !owner || owner === uid;
+      mergedWorkouts = Object.assign({}, cloudWorkouts);
+      if (sameAccount) {
+        Object.keys(state.workouts).forEach(d => {
+          if (!mergedWorkouts[d]) mergedWorkouts[d] = state.workouts[d];
+        });
+        needFitPush = Object.keys(state.workouts).some(d => !cloudWorkouts[d]);
+      }
+    }
+
     const changed = JSON.stringify(mergedTasks) !== JSON.stringify(state.tasks) ||
-      JSON.stringify(cloudCourses) !== JSON.stringify(state.courses);
+      JSON.stringify(cloudCourses) !== JSON.stringify(state.courses) ||
+      workoutsSig(mergedWorkouts) !== workoutsSig(state.workouts);
 
     state.tasks = mergedTasks;
     state.courses = cloudCourses;
+    state.workouts = mergedWorkouts;
+    if (fitnessOk) localStorage.setItem(FIT_OWNER_KEY, uid);
     saveLocal();
     if (changed || forceRender) renderAll();
+    if (needFitPush) schedulePush(); // 本机有、云端没有的打卡，拉取后补推
   } catch (err) {
     console.warn('[sync] pull failed', err);
     syncError('云端数据读取失败：' + (err.message || '请检查网络'));
@@ -393,6 +488,7 @@ function subscribeRealtime() {
     .channel('studyhub-' + uid)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks', filter: `user_id=eq.${uid}` }, onRemoteChange)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'courses', filter: `user_id=eq.${uid}` }, onRemoteChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'fitness', filter: `user_id=eq.${uid}` }, onRemoteChange)
     .subscribe();
 }
 
@@ -405,6 +501,7 @@ function handleAuthUser(user) {
   }
   if (prevId !== user.id) {
     console.info('[sync] signed in as', user.id, user.email);
+    cloud.fitnessWarned = false;
     pullCloud(true);
     subscribeRealtime();
   }
@@ -417,7 +514,7 @@ function initCloud() {
     cloud.client.auth.getSession().then(({ data }) => {
       const user = data && data.session && data.session.user;
       handleAuthUser(user);
-      if (user) syncToast('已连接云端，任务和课表会自动同步');
+      if (user) syncToast('已连接云端，任务、课表和健身会自动同步');
       else syncToast('未登录：数据仅保存在本机，登录后自动同步到云端');
     });
     return true;
@@ -496,6 +593,55 @@ function focusText(sec) {
   return sec >= 3600 ? hms(sec) : `${pad(Math.floor(sec / 60))}:${pad(sec % 60)}`;
 }
 
+/* ===== 番茄钟提示音（Web Audio 合成，无音频文件） ===== */
+let audioCtx = null;
+
+// 浏览器要求音频在用户手势中解锁：开始专注时调用一次
+function primeAudio() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    return audioCtx;
+  } catch (e) {
+    return null;
+  }
+}
+
+function scheduleChime(ctx) {
+  try {
+    const t0 = ctx.currentTime + 0.02;
+    const notes = [880, 1108.73, 1318.51]; // A5 · C#6 · E6，柔和上行三音
+    notes.forEach((freq, i) => {
+      const start = t0 + i * 0.18;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.18, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 1.1);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 1.2);
+    });
+  } catch (e) {
+    console.warn('[focus] 提示音播放失败', e);
+  }
+}
+
+function playFocusChime() {
+  if (navigator.vibrate) {
+    try { navigator.vibrate([120, 90, 120]); } catch (e) { /* 忽略 */ }
+  }
+  const ctx = primeAudio();
+  if (!ctx) return;
+  if (ctx.state === 'running') { scheduleChime(ctx); return; }
+  // 后台久了可能被挂起：恢复后再响（需此前被用户手势解锁过）
+  ctx.resume().then(() => { if (ctx.state === 'running') scheduleChime(ctx); }).catch(() => {});
+}
+
 function renderFocus() {
   const panel = $('focus-panel');
   if (!panel) return;
@@ -509,6 +655,7 @@ function renderFocus() {
 }
 
 function startTaskTimer(t) {
+  primeAudio(); // 借这次点击解锁音频，倒计时结束时才能响
   state.tasks.forEach(o => { if (o !== t && o.run) pauseTimer(o); });
   if (state.focus && state.focus.taskId === t.id) {
     t.run = Date.now(); // 继续本任务未结束的专注
@@ -766,63 +913,7 @@ function renderCountdown() {
   document.querySelectorAll('[data-cd]').forEach(el => { el.textContent = cdText(state.exams[el.dataset.cd]); });
 }
 
-/* ===== 渲染：数据 ===== */
-function renderData() {
-  const taskCount = state.tasks.length;
-  const fitDays = Object.keys(state.workouts).filter(d => state.workouts[d].done).length;
-  const bytes = (localStorage.getItem(KEY) || '').length;
-  $('data-stat').textContent = `课程 ${state.courses.length} 门 · 任务 ${taskCount} 条 · 健身打卡 ${fitDays} 天 · 约 ${(bytes / 1024).toFixed(1)} KB`;
-}
-
-/* ===== 数据导出 / 导入（JSON 备份，用于跨设备同步） ===== */
-function dataMsg(text) {
-  const el = $('data-msg');
-  if (el) el.textContent = text;
-}
-
-function exportData() {
-  const payload = { app: 'studyhub', version: 1, exportedAt: new Date().toISOString(), data: state };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const now = new Date();
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `学习管理-${todayStr()}-${pad(now.getHours())}${pad(now.getMinutes())}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
-  dataMsg(`已导出 ${(blob.size / 1024).toFixed(1)} KB，文件名为「${a.download}」`);
-}
-
-function importData(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    let raw;
-    try { raw = JSON.parse(String(reader.result || '')); }
-    catch (e) { alert('这个文件不是有效的 JSON，导入已取消。'); return; }
-    const payload = raw && raw.data && typeof raw.data === 'object' ? raw.data : raw;
-    if (!payload || typeof payload !== 'object' || !['courses', 'tasks', 'workouts', 'exams'].some(k => k in payload)) {
-      alert('文件里没有本应用的数据（缺少 courses / tasks / workouts / exams），导入已取消。');
-      return;
-    }
-    if (!confirm('导入会覆盖当前浏览器里的全部数据，确定继续吗？')) return;
-    state = normalize(payload);
-    if (!state.ui.taskDate) state.ui.taskDate = todayStr();
-    // 导入的计时可能来自另一台设备的进行中状态，先结算为已累计时长，避免把间隔时间算进去
-    state.tasks.forEach(t => {
-      if (t.run) t.actualSeconds = elapsed(t);
-      t.run = 0;
-    });
-    state.focus = null;
-    save();
-    dataMsg('导入成功，正在刷新…');
-    setTimeout(() => location.reload(), 200);
-  };
-  reader.onerror = () => alert('读取文件失败，请重试。');
-  reader.readAsText(file);
-}
-
+/* ===== 渲染：全部 ===== */
 function renderAll() {
   renderDash();
   renderCourses();
@@ -830,7 +921,6 @@ function renderAll() {
   renderFitness();
   renderCountdown();
   renderFocus();
-  renderData();
 }
 
 /* ===== 每秒实时刷新（不重建 DOM，避免打断输入） ===== */
@@ -865,9 +955,14 @@ function liveUpdate() {
       save();
       renderFocus();
     } else {
+      const remain = focusRemain();
       const timeEl = $('fp-time');
-      if (timeEl) timeEl.textContent = focusText(focusRemain());
-      if (focusRemain() <= 0) endTaskTimer(t); // 倒计时结束自动结算
+      if (timeEl) timeEl.textContent = focusText(remain);
+      if (remain <= 0) {
+        playFocusChime();
+        syncToast(`🍅 番茄钟完成：${t.name}，休息一下吧`);
+        endTaskTimer(t); // 倒计时结束自动结算
+      }
     }
   }
 }
@@ -1077,25 +1172,6 @@ $('sk-date').addEventListener('change', e => {
   save(); renderCountdown(); renderDash();
 });
 
-$('btn-export').addEventListener('click', exportData);
-$('btn-import').addEventListener('click', () => $('import-file').click());
-$('import-file').addEventListener('change', e => {
-  const file = e.target.files && e.target.files[0];
-  if (file) importData(file);
-  e.target.value = '';
-});
-
-$('btn-clear').addEventListener('click', () => {
-  if (!confirm('确定清空全部数据？课表、任务、计时、健身记录都会删除。')) return;
-  if (!confirm('再次确认：清空后无法恢复，确定要继续吗？')) return;
-  localStorage.removeItem(KEY);
-  state = clone(DEFAULT);
-  state.ui.taskDate = todayStr();
-  save();
-  renderAll();
-  switchTab();
-});
-
 /* ===== 事件：健身月历与表单 ===== */
 function fitRecord(date) {
   return state.workouts[date] || (state.workouts[date] = { date, type: '', duration: 0, done: false, note: '' });
@@ -1148,7 +1224,6 @@ document.addEventListener('change', e => {
   save();
   renderFitness();
   renderDash();
-  if (state.ui.tab === 'data') renderData();
 });
 
 /* ===== 事件：点击操作 ===== */
@@ -1210,7 +1285,7 @@ $('week-grid').addEventListener('click', e => {
 
 /* ===== 启动 ===== */
 (function init() {
-  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'data'];
+  const TABS = ['dash', 'courses', 'tasks', 'fitness'];
   const hashTab = (location.hash || '').replace('#', '');
   if (TABS.includes(hashTab)) state.ui.tab = hashTab;
   if (!TABS.includes(state.ui.tab)) state.ui.tab = 'dash'; // 旧存档可能停在已删除的倒计时页
