@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习管理 · 考公 / 四级 / 课表</title>
+<script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="style.css?v=20261105c">
+</head>
+<body>
+<header class="topbar">
+  <nav id="tabs" class="tabs">
+    <button data-tab="dash" class="active">仪表盘</button>
+    <button data-tab="courses">课表</button>
+    <button data-tab="tasks">任务</button>
+    <button data-tab="fitness">健身</button>
+    <button data-tab="data">数据</button>
+  </nav>
+  <div class="auth-area">
+    <button id="auth-btn" class="auth-btn" type="button">登录 / 注册</button>
+  </div>
+</header>
+
+<main>
+  <!-- 仪表盘 -->
+  <section id="page-dash" class="page active">
+    <div class="hero">
+      <h1>今日概览</h1>
+      <p class="hero-sub"><span id="d-date">--</span><span class="dot">·</span><span id="d-week"></span></p>
+    </div>
+
+    <div class="big-card">
+      <div class="quote-block">
+        <span class="quote" id="daily-quote">我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。</span>
+        <span class="quote-sign" id="daily-quote-sign">—— 致努力发光的你</span>
+      </div>
+
+      <div class="stats stats-2">
+        <div class="stat">
+          <div class="stat-icon">🎯</div>
+          <div class="stat-num cd" data-cd="guokao">--</div>
+          <div class="stat-label">国考倒计时</div>
+          <input type="date" id="gk-date" class="stat-date" aria-label="国考日期">
+        </div>
+        <div class="stat">
+          <div class="stat-icon">📌</div>
+          <div class="stat-num cd" data-cd="shengkao">--</div>
+          <div class="stat-label">省考倒计时</div>
+          <input type="date" id="sk-date" class="stat-date" aria-label="省考日期">
+        </div>
+      </div>
+
+      <div class="stats stats-3">
+        <div class="stat">
+          <div class="stat-icon">✅</div>
+          <div class="stat-num" id="d-tasks">0/0</div>
+          <div class="stat-label">今日任务完成</div>
+        </div>
+        <div class="stat">
+          <div class="stat-icon">📚</div>
+          <div class="stat-num" id="d-study">0 分钟</div>
+          <div class="stat-label">今日学习时长</div>
+        </div>
+        <div class="stat">
+          <div class="stat-icon">💪</div>
+          <div class="stat-num" id="d-fit">未打卡</div>
+          <div class="stat-label" id="d-fit-week"></div>
+        </div>
+      </div>
+
+      <div class="block progress-block">
+        <div class="block-head">
+          <h2>今日专注进度</h2>
+          <span class="muted" id="study-progress-text">0.0 / 2 小时</span>
+        </div>
+        <div class="progress"><div id="study-progress" class="progress-fill"></div></div>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2>今日空闲时间段</h2>
+          <button id="btn-dash-suggest" class="btn small">✨ 智能排程</button>
+        </div>
+        <ul id="d-free" class="slots"></ul>
+        <div id="d-suggest" class="suggest hidden"></div>
+      </div>
+
+      <div class="block">
+        <h2>今日任务</h2>
+        <ul id="d-tasklist" class="tasklist"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 课表 -->
+  <section id="page-courses" class="page">
+    <div class="hero">
+      <h1>我的课表</h1>
+      <p class="hero-sub">08:00–22:00 · 每周课程与空闲时间</p>
+    </div>
+
+    <div class="big-card">
+      <div class="block first">
+        <h2>添加课程</h2>
+        <form id="course-form" class="form-grid">
+          <label>课程名<input name="name" maxlength="30" placeholder="如：数据结构" required></label>
+          <label>星期
+            <select name="weekday">
+              <option value="1">周一</option><option value="2">周二</option>
+              <option value="3">周三</option><option value="4">周四</option>
+              <option value="5">周五</option><option value="6">周六</option>
+              <option value="7">周日</option>
+            </select>
+          </label>
+          <label>开始<input type="time" name="start" value="08:00" required></label>
+          <label>结束<input type="time" name="end" value="09:40" required></label>
+          <label>地点<input name="place" maxlength="20" placeholder="如：教三 302"></label>
+          <button class="btn" type="submit">添加课程</button>
+        </form>
+        <p id="course-warn" class="warn hidden"></p>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2>周课表</h2>
+          <span class="muted">点击课程块可删除</span>
+        </div>
+        <div class="week-wrap"><div id="week-grid" class="week-grid"></div></div>
+      </div>
+
+      <div class="block">
+        <h2>课程列表</h2>
+        <ul id="course-list" class="courselist"></ul>
+      </div>
+
+      <div class="block">
+        <h2>今日空闲时间段</h2>
+        <ul id="c-free" class="slots"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 任务 -->
+  <section id="page-tasks" class="page">
+    <div class="hero">
+      <h1>今日任务</h1>
+      <p class="hero-sub">计划、专注与记录</p>
+    </div>
+
+    <div class="big-card">
+      <div class="block first">
+        <h2>添加任务</h2>
+        <form id="task-form" class="form-grid">
+          <label>任务名<input name="name" maxlength="40" placeholder="如：行测资料分析 30 题" required></label>
+          <label>类别
+            <select name="cat">
+              <option value="gongkao">考公</option>
+              <option value="cet4">四级</option>
+              <option value="other">其他</option>
+              <option value="fitness">健身</option>
+            </select>
+          </label>
+          <label>日期<input type="date" name="date"></label>
+          <label>计划开始<input type="time" name="start"></label>
+          <label>计划结束<input type="time" name="end"></label>
+          <label>优先级
+            <select name="priority">
+              <option value="1">高</option>
+              <option value="2" selected>中</option>
+              <option value="3">低</option>
+            </select>
+          </label>
+          <label>预计分钟<input type="number" name="est" min="5" max="480" step="5" value="60"></label>
+          <button class="btn" type="submit">添加任务</button>
+        </form>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2>任务列表</h2>
+          <input type="date" id="task-date">
+        </div>
+        <div class="row-gap">
+          <button id="btn-today" class="btn ghost small">今天</button>
+          <button id="btn-suggest" class="btn ghost small">生成排程建议</button>
+          <label class="focus-len">专注时长
+            <input type="number" id="focus-min" min="5" max="120" step="5" value="25"> 分钟
+          </label>
+          <span class="muted" id="suggest-hint"></span>
+        </div>
+        <ul id="task-list" class="tasklist"></ul>
+        <div id="suggest-box" class="suggest hidden"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 健身 -->
+  <section id="page-fitness" class="page">
+    <div class="hero">
+      <h1>健身记录</h1>
+      <p class="hero-sub">月历视图 · 点击日期记录</p>
+    </div>
+
+    <div class="big-card">
+      <div class="block first streak-block">
+        <div id="fit-streak" class="streak">今天动起来吧！</div>
+      </div>
+
+      <div class="stats stats-2">
+        <div class="stat">
+          <div class="stat-icon">⏱️</div>
+          <div class="stat-num" id="fit-month-minutes">0 分钟</div>
+          <div class="stat-label">本月总时长</div>
+        </div>
+        <div class="stat">
+          <div class="stat-icon">📅</div>
+          <div class="stat-num" id="fit-days">0 天</div>
+          <div class="stat-label">本月打卡</div>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="cal-head">
+          <button id="cal-prev" class="cal-nav" type="button" aria-label="上个月">‹</button>
+          <h2 id="cal-title">--</h2>
+          <button id="cal-next" class="cal-nav" type="button" aria-label="下个月">›</button>
+        </div>
+        <div class="cal-week">
+          <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+        </div>
+        <div id="fit-cal" class="cal-grid"></div>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2 id="fit-form-title">--</h2>
+          <span class="muted">修改后自动保存</span>
+        </div>
+        <div class="fit-form">
+          <label class="fit-check"><input type="checkbox" data-fit="done" id="fit-done"> 完成</label>
+          <label>类型<select data-fit="type" id="fit-type"></select></label>
+          <label>时长（分钟）<input type="number" data-fit="duration" id="fit-duration" min="0" max="600" step="5" inputmode="numeric" placeholder="如 45"></label>
+          <label>备注<input data-fit="note" id="fit-note" maxlength="30" placeholder="如 卧推 4 组"></label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 数据 -->
+  <section id="page-data" class="page">
+    <div class="hero">
+      <h1>数据管理</h1>
+      <p class="hero-sub">本地保存 · 导入导出</p>
+    </div>
+
+    <div class="big-card">
+      <div class="block first">
+        <h2>本地数据</h2>
+        <p class="muted">所有数据保存在当前浏览器的 localStorage 中，刷新不丢；换浏览器或清理缓存会丢失。</p>
+        <p id="data-stat" class="muted"></p>
+        <div class="row-gap">
+          <button id="btn-export" class="btn">导出数据</button>
+          <button id="btn-import" class="btn ghost">导入数据</button>
+          <button id="btn-clear" class="btn danger">清空全部数据</button>
+        </div>
+        <input type="file" id="import-file" accept=".json,application/json" class="hidden">
+        <p id="data-msg" class="muted"></p>
+      </div>
+      <div class="block">
+        <p class="muted">导出会下载一个 JSON 文件；在另一台设备点「导入数据」选择该文件即可覆盖同步（导入前会再次确认）。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 沉浸式专注计时器 -->
+<div id="focus-panel" class="focus-panel hidden" aria-live="polite">
+  <div class="fp-label">专注中</div>
+  <div class="fp-task" id="fp-task">—</div>
+  <div class="fp-time" id="fp-time">25:00</div>
+  <div class="fp-actions">
+    <button class="btn small" id="fp-toggle">⏸ 暂停</button>
+    <button class="btn ghost small" id="fp-stop">⏹ 结束</button>
+  </div>
+</div>
+
+<!-- 登录 / 注册 -->
+<div id="auth-modal" class="auth-modal hidden" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+  <div class="auth-card">
+    <button id="auth-close" class="auth-close" type="button" aria-label="关闭">×</button>
+    <h2 id="auth-title">登录 / 注册</h2>
+    <p class="auth-tip">用邮箱和密码登录，数据仍保存在本机</p>
+    <form id="auth-form" class="auth-form">
+      <label>邮箱<input type="email" id="auth-email" required autocomplete="email" placeholder="you@example.com"></label>
+      <label>密码<input type="password" id="auth-password" required minlength="6" autocomplete="current-password" placeholder="至少 6 位"></label>
+      <div class="auth-actions">
+        <button type="submit" id="auth-login" class="btn">登录</button>
+        <button type="button" id="auth-signup" class="btn ghost">注册</button>
+      </div>
+      <p id="auth-msg" class="auth-msg"></p>
+    </form>
+  </div>
+</div>
+
+<script src="app.js?v=20261105c"></script>
+<script>
+/* 仅做展示：学习进度条 + 任务优先级装饰色（只读取 localStorage，不修改数据） */
+(function () {
+  const KEY = 'studyhub.v1';
+  const pad = n => String(n).padStart(2, '0');
+  const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+
+  function studySeconds() {
+    let raw = {};
+    try { raw = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { return 0; }
+    const today = todayStr();
+    return (raw.tasks || []).filter(t => t.date === today).reduce((sum, t) => {
+      const base = Number(t.actualSeconds) || 0;
+      return sum + base + (t.run ? (Date.now() - t.run) / 1000 : 0);
+    }, 0);
+  }
+
+  function renderProgress() {
+    const fill = document.getElementById('study-progress');
+    const text = document.getElementById('study-progress-text');
+    if (!fill) return;
+    const sec = studySeconds();
+    const pct = Math.min(100, (sec / 7200) * 100);
+    fill.style.width = pct.toFixed(1) + '%';
+    fill.classList.toggle('full', pct >= 100);
+    if (text) text.textContent = `${(sec / 3600).toFixed(1)} / 2 小时`;
+  }
+
+  function decoratePriority() {
+    document.querySelectorAll('#task-list li, #d-tasklist li').forEach(li => {
+      const badge = li.querySelector('.pri');
+      if (!badge) return;
+      const txt = badge.textContent.trim();
+      li.classList.toggle('prio-high', txt === '高');
+      li.classList.toggle('prio-mid', txt === '中');
+      li.classList.toggle('prio-low', txt === '低');
+    });
+  }
+
+  function tick() { renderProgress(); decoratePriority(); }
+
+  tick();
+  setInterval(tick, 1000);
+  new MutationObserver(decoratePriority).observe(document.body, { childList: true, subtree: true });
+})();
+</script>
+<script>
+/* 每日一言：按日期轮换，只做展示 */
+(function () {
+  const QUOTES = [
+    '我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。',
+    '慢慢来，比较快。',
+    '不要慌，太阳下山有月光，月亮西沉有朝阳。',
+    '去感受，去经历，去成为你自己。',
+    '今天也是默默扎根的一天，辛苦了。',
+    '允许一切发生，然后继续前进。',
+    '一步一步走，总会到达的。',
+    '愿你在自己的节奏里，安稳地长大。',
+    '今天也有一点小小的进步，就很好。',
+    '生活不是赶路，是感受路。'
+  ];
+  const SIGNS = [
+    '—— 写在某个普通的傍晚',
+    '—— 致努力发光的你',
+    '—— 写在一个安静的午后',
+    '—— 给慢慢走路的你'
+  ];
+
+  const quoteEl = document.getElementById('daily-quote');
+  const signEl = document.getElementById('daily-quote-sign');
+  if (!quoteEl) return;
+
+  const now = new Date();
+  const seed = now.getFullYear() * 372 + (now.getMonth() + 1) * 31 + now.getDate();
+  quoteEl.textContent = QUOTES[seed % QUOTES.length];
+  if (signEl) signEl.textContent = SIGNS[seed % SIGNS.length];
+})();
+</script>
+<script src="auth.js?v=20261105c"></script>
+</body>
+</html>
