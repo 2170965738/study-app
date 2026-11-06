@@ -3,90 +3,172 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>学习管理 · 考公 / 四级 / 课表</title>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<link rel="stylesheet" href="style.css?v=20261105c">
+<link rel="stylesheet" href="style.css?v=20261106n">
 </head>
 <body>
 <header class="topbar">
+  <label class="top-exam" title="点击修改省考日期">
+    <span class="top-exam-icon" aria-hidden="true">⏳</span>
+    <span class="top-exam-label">省考倒计时</span>
+    <span class="top-exam-num" data-cd="shengkao">--</span>
+    <input type="date" id="sk-date" class="top-exam-date" aria-label="省考日期">
+  </label>
   <nav id="tabs" class="tabs">
     <button data-tab="dash" class="active">仪表盘</button>
     <button data-tab="courses">课表</button>
     <button data-tab="tasks">任务</button>
     <button data-tab="fitness">健身</button>
+    <button data-tab="mood">碎碎念</button>
   </nav>
   <div class="auth-area">
     <button id="auth-btn" class="auth-btn" type="button">登录 / 注册</button>
+    <div id="avatar-wrap" class="avatar-wrap hidden">
+      <button id="avatar-btn" class="avatar-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="账户与头像菜单">
+        <img id="avatar-img" class="avatar-img hidden" alt="用户头像">
+        <span id="avatar-emoji" class="avatar-emoji" aria-hidden="true">🌱</span>
+      </button>
+      <div id="avatar-menu" class="avatar-menu hidden" role="dialog" aria-label="账户与头像设置">
+        <div class="avatar-menu-head">
+          <span class="avatar-menu-avatar">
+            <img id="avatar-menu-img" class="avatar-img hidden" alt="">
+            <span id="avatar-menu-emoji" class="avatar-emoji" aria-hidden="true">🌱</span>
+          </span>
+          <div class="avatar-menu-meta">
+            <p class="avatar-menu-title">我的账号</p>
+            <p class="avatar-menu-email" id="avatar-email">—</p>
+          </div>
+        </div>
+
+        <div class="avatar-menu-actions">
+          <label id="avatar-upload" class="btn small avatar-upload" for="avatar-file" tabindex="0" role="button">
+            <span class="avatar-upload-icon" aria-hidden="true">📷</span>
+            上传自定义头像
+            <input type="file" id="avatar-file" accept="image/*" hidden>
+          </label>
+          <button id="avatar-reset" class="btn ghost small avatar-reset" type="button">恢复默认 Emoji</button>
+        </div>
+
+        <div id="avatar-preview" class="avatar-preview hidden">
+          <img id="avatar-local-img" class="avatar-local-img" alt="头像预览">
+          <div class="avatar-preview-side">
+            <p class="avatar-preview-tip">预览</p>
+            <p class="avatar-preview-hint" id="avatar-preview-hint">保存后才会更新到账号</p>
+            <div class="avatar-preview-actions">
+              <button id="avatar-save" class="btn small" type="button">保存头像</button>
+              <button id="avatar-cancel" class="btn ghost small" type="button">取消</button>
+            </div>
+          </div>
+        </div>
+
+        <p id="avatar-status" class="avatar-status" role="status"></p>
+
+        <button id="avatar-logout" class="avatar-logout" type="button">退出登录</button>
+      </div>
+    </div>
   </div>
+  <!-- 国考显示已移除；保留隐藏输入，避免 app.js 读取 #gk-date 时报错 -->
+  <input type="date" id="gk-date" class="ghost-input" aria-hidden="true" tabindex="-1">
 </header>
 
 <main>
   <!-- 仪表盘 -->
   <section id="page-dash" class="page active">
-    <div class="hero">
-      <h1>今日概览</h1>
-      <p class="hero-sub"><span id="d-date">--</span><span class="dot">·</span><span id="d-week"></span></p>
+    <!-- 首屏题记 -->
+    <div class="hero-section">
+      <p class="hero-quote" id="hero-quote">星光不问赶路人，时光不负有心人。</p>
+      <!-- app.js 仍会更新这两个日期节点，保留隐藏占位，避免改动业务逻辑 -->
+      <span id="d-date" class="hero-date-holder"></span>
+      <span id="d-week" class="hero-date-holder"></span>
     </div>
 
-    <div class="big-card">
-      <div class="quote-block">
-        <span class="quote" id="daily-quote">我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。</span>
-        <span class="quote-sign" id="daily-quote-sign">—— 致努力发光的你</span>
-      </div>
-
-      <div class="stats stats-2">
-        <div class="stat">
-          <div class="stat-icon">🎯</div>
-          <div class="stat-num cd" data-cd="guokao">--</div>
-          <div class="stat-label">国考倒计时</div>
-          <input type="date" id="gk-date" class="stat-date" aria-label="国考日期">
-        </div>
-        <div class="stat">
-          <div class="stat-icon">📌</div>
-          <div class="stat-num cd" data-cd="shengkao">--</div>
-          <div class="stat-label">省考倒计时</div>
-          <input type="date" id="sk-date" class="stat-date" aria-label="省考日期">
-        </div>
-      </div>
-
-      <div class="stats stats-3">
-        <div class="stat">
+    <div class="dash-body">
+      <!-- 顶部三项今日数据 -->
+      <div class="stats-row">
+        <div class="dash-card mini-stat">
           <div class="stat-icon">✅</div>
           <div class="stat-num" id="d-tasks">0/0</div>
           <div class="stat-label">今日任务完成</div>
         </div>
-        <div class="stat">
+        <div class="dash-card mini-stat">
           <div class="stat-icon">📚</div>
           <div class="stat-num" id="d-study">0 分钟</div>
           <div class="stat-label">今日学习时长</div>
         </div>
-        <div class="stat">
+        <div class="dash-card mini-stat">
           <div class="stat-icon">💪</div>
           <div class="stat-num" id="d-fit">未打卡</div>
           <div class="stat-label" id="d-fit-week"></div>
         </div>
       </div>
 
-      <div class="block progress-block">
-        <div class="block-head">
-          <h2>今日专注进度</h2>
-          <span class="muted" id="study-progress-text">0.0 / 2 小时</span>
-        </div>
-        <div class="progress"><div id="study-progress" class="progress-fill"></div></div>
-      </div>
+      <div class="dash-grid">
+        <!-- 左列：专注进度 + 空闲时间 -->
+        <div class="dash-col">
+          <div class="dash-card">
+            <div class="block-head">
+              <h2>今日专注进度</h2>
+              <label class="progress-goal" title="设置今天想专注的分钟数，保存在本机">
+                <span>今日目标</span>
+                <input type="number" id="study-goal" min="10" max="600" step="10" value="120" inputmode="numeric" aria-label="今日专注目标分钟数">
+                <span>分钟</span>
+              </label>
+            </div>
+            <div class="progress"><div id="study-progress" class="progress-fill"></div></div>
+            <div class="progress-meta">
+              <span class="muted" id="study-progress-text">0 / 120 分钟</span>
+              <span class="progress-pct" id="study-progress-pct">0%</span>
+            </div>
+          </div>
 
-      <div class="block">
-        <div class="block-head">
-          <h2>今日空闲时间段</h2>
-          <button id="btn-dash-suggest" class="btn small">✨ 智能排程</button>
+          <div class="dash-card">
+            <div class="block first">
+              <div class="block-head">
+                <h2>今日空闲时间段</h2>
+                <button id="btn-dash-suggest" class="btn small">✨ 智能排程</button>
+              </div>
+              <ul id="d-free" class="slots"></ul>
+              <div id="d-suggest" class="suggest hidden"></div>
+            </div>
+          </div>
         </div>
-        <ul id="d-free" class="slots"></ul>
-        <div id="d-suggest" class="suggest hidden"></div>
-      </div>
 
-      <div class="block">
-        <h2>今日任务</h2>
-        <ul id="d-tasklist" class="tasklist"></ul>
+        <!-- 右列：今日任务列表 -->
+        <div class="dash-col dash-col--right">
+          <div class="dash-card tasks-card">
+            <div class="tasks-block">
+              <h2>今日任务</h2>
+              <ul id="d-tasklist" class="tasklist"></ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- 下方全宽：学习足迹 -->
+        <div class="dash-card heatmap-card">
+          <div class="heatmap-head">
+            <div>
+              <h2>学习足迹</h2>
+              <p class="heatmap-summary" id="heatmap-summary">最近 12 周</p>
+            </div>
+            <div class="heatmap-legend" aria-hidden="true">
+              <span>少</span>
+              <i class="heat-0"></i>
+              <i class="heat-1"></i>
+              <i class="heat-2"></i>
+              <i class="heat-3"></i>
+              <i class="heat-4"></i>
+              <span>多</span>
+            </div>
+          </div>
+          <div class="heatmap-scroll">
+            <div id="heatmap" class="heatmap" role="group" aria-label="最近 12 周学习热力图"></div>
+          </div>
+          <p class="heatmap-hint">完成一次专注，就能点亮一个小方块哦 ✨</p>
+        </div>
       </div>
     </div>
   </section>
@@ -244,7 +326,74 @@
       </div>
     </div>
   </section>
+
+  <!-- 碎碎念 / 心情树洞 -->
+  <section id="page-mood" class="page">
+    <div class="hero journal-hero">
+      <h1 class="journal-title">
+        <span class="journal-title-en">MY JOURNAL</span>
+        <span class="journal-title-sep" aria-hidden="true">/</span>
+        <span>心情树洞</span>
+      </h1>
+      <p class="hero-sub">记录备考路上的碎碎念</p>
+    </div>
+
+    <div class="journal-wrap">
+      <div class="big-card journal-editor">
+        <p class="mood-sub" id="mood-sub">今天的情绪，也值得被轻轻记下来。</p>
+        <form id="mood-form" class="mood-form">
+          <textarea id="mood-input" maxlength="120" rows="4" aria-label="心情内容"
+            placeholder="今天发生了什么？此刻在想些什么…（Ctrl / ⌘ + Enter 记录）"></textarea>
+          <div class="mood-form-foot">
+            <span class="mood-tip" id="mood-msg" role="status"></span>
+            <button class="btn mood-btn" type="submit" id="mood-submit">记录</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="big-card journal-archive">
+        <div class="block-head">
+          <h2>所有碎碎念</h2>
+          <span class="mood-count" id="mood-count">0 条</span>
+        </div>
+        <ul id="mood-list" class="mood-list"></ul>
+      </div>
+    </div>
+  </section>
 </main>
+
+<!-- 白噪音悬浮播放器 -->
+<details class="noise-fab" id="noise-fab">
+  <summary class="noise-fab-btn" aria-label="白噪音">
+    <span class="fab-icon" aria-hidden="true">🎵</span>
+    <span class="fab-close" aria-hidden="true">✕</span>
+  </summary>
+  <div class="noise-menu" role="group" aria-label="白噪音选择">
+    <p class="noise-hint" id="noise-hint" role="status"></p>
+    <!-- 测试音源来自 Mixkit，正式使用可替换成自托管 mp3 -->
+    <button class="noise-btn" type="button" data-name="咖啡馆" aria-pressed="false"
+      data-src="https://assets.mixkit.co/active_storage/sfx/444/444-preview.mp3">
+      <span class="noise-emoji" aria-hidden="true">☕</span>
+      <span class="noise-name">咖啡馆</span>
+    </button>
+    <button class="noise-btn" type="button" data-name="下雨" aria-pressed="false"
+      data-src="https://assets.mixkit.co/active_storage/sfx/2393/2393-preview.mp3">
+      <span class="noise-emoji" aria-hidden="true">🌧️</span>
+      <span class="noise-name">下雨</span>
+    </button>
+    <button class="noise-btn" type="button" data-name="图书馆" aria-pressed="false"
+      data-src="https://assets.mixkit.co/active_storage/sfx/447/447-preview.mp3">
+      <span class="noise-emoji" aria-hidden="true">📚</span>
+      <span class="noise-name">图书馆</span>
+    </button>
+    <button class="noise-btn" type="button" data-name="海浪" aria-pressed="false"
+      data-src="https://assets.mixkit.co/active_storage/sfx/1196/1196-preview.mp3">
+      <span class="noise-emoji" aria-hidden="true">🌊</span>
+      <span class="noise-name">海浪</span>
+    </button>
+  </div>
+  <audio id="noise-audio" loop preload="none"></audio>
+</details>
 
 <!-- 沉浸式专注计时器 -->
 <div id="focus-panel" class="focus-panel hidden" aria-live="polite">
@@ -275,14 +424,44 @@
   </div>
 </div>
 
-<script src="app.js?v=20261105e"></script>
+<!-- 头像上传错误提示 -->
+<div id="avatar-alert" class="avatar-alert hidden" role="alertdialog" aria-modal="true" aria-labelledby="avatar-alert-title">
+  <div class="avatar-alert-card">
+    <div id="avatar-alert-icon" class="avatar-alert-icon" aria-hidden="true">⚠️</div>
+    <h2 id="avatar-alert-title">头像上传失败</h2>
+    <p id="avatar-alert-msg"></p>
+    <button id="avatar-alert-close" class="btn small" type="button">知道了</button>
+  </div>
+</div>
+
+<script src="app.js?v=20261106o"></script>
 <script>
-/* 仅做展示：学习进度条 + 任务优先级装饰色（只读取 localStorage，不修改数据） */
+/* 仪表盘专注目标进度：只读取 localStorage，目标值也只存在本机 */
 (function () {
   const KEY = 'studyhub.v1';
+  const GOAL_KEY = 'studyhub.dailyGoalMin';
+  const DEFAULT_GOAL = 120;
   const pad = n => String(n).padStart(2, '0');
   const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
 
+  const fill = document.getElementById('study-progress');
+  const text = document.getElementById('study-progress-text');
+  const pctEl = document.getElementById('study-progress-pct');
+  const goalInput = document.getElementById('study-goal');
+
+  function clampGoal(v) {
+    const n = Math.round(Number(v));
+    if (!isFinite(n) || n <= 0) return DEFAULT_GOAL;
+    return Math.min(600, Math.max(10, n));
+  }
+  function readGoal() {
+    let raw = null;
+    try { raw = localStorage.getItem(GOAL_KEY); } catch (e) { raw = null; }
+    return raw == null ? DEFAULT_GOAL : clampGoal(raw);
+  }
+  function writeGoal(min) {
+    try { localStorage.setItem(GOAL_KEY, String(min)); } catch (e) { /* 忽略隐私模式限制 */ }
+  }
   function studySeconds() {
     let raw = {};
     try { raw = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { return 0; }
@@ -294,14 +473,32 @@
   }
 
   function renderProgress() {
-    const fill = document.getElementById('study-progress');
-    const text = document.getElementById('study-progress-text');
     if (!fill) return;
+    const goal = readGoal();
+    if (goalInput && document.activeElement !== goalInput) goalInput.value = String(goal);
     const sec = studySeconds();
-    const pct = Math.min(100, (sec / 7200) * 100);
-    fill.style.width = pct.toFixed(1) + '%';
+    const pct = goal > 0 ? (sec / (goal * 60)) * 100 : 0;
+    fill.style.width = Math.min(100, pct).toFixed(1) + '%';
     fill.classList.toggle('full', pct >= 100);
-    if (text) text.textContent = `${(sec / 3600).toFixed(1)} / 2 小时`;
+    if (text) text.textContent = `${Math.floor(sec / 60)} / ${goal} 分钟`;
+    if (pctEl) {
+      pctEl.textContent = `${Math.round(pct)}%`;
+      pctEl.classList.toggle('reached', pct >= 100);
+    }
+  }
+
+  if (goalInput) {
+    const commitGoal = () => {
+      const goal = clampGoal(goalInput.value);
+      goalInput.value = String(goal);
+      writeGoal(goal);
+      renderProgress();
+    };
+    goalInput.addEventListener('change', commitGoal);
+    goalInput.addEventListener('blur', commitGoal);
+    goalInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); goalInput.blur(); }
+    });
   }
 
   function decoratePriority() {
@@ -323,37 +520,20 @@
 })();
 </script>
 <script>
-/* 每日一言：按日期轮换，只做展示 */
+/* 首屏欢迎语：每次刷新随机一条，只做展示 */
 (function () {
   const QUOTES = [
-    '我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。',
+    '星光不问赶路人，时光不负有心人。',
     '慢慢来，比较快。',
-    '不要慌，太阳下山有月光，月亮西沉有朝阳。',
-    '去感受，去经历，去成为你自己。',
-    '今天也是默默扎根的一天，辛苦了。',
-    '允许一切发生，然后继续前进。',
-    '一步一步走，总会到达的。',
-    '愿你在自己的节奏里，安稳地长大。',
-    '今天也有一点小小的进步，就很好。',
-    '生活不是赶路，是感受路。'
+    '今天也有一点小小的进步，就很好了。',
+    '我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。',
+    '不要慌，太阳下山有月光。'
   ];
-  const SIGNS = [
-    '—— 写在某个普通的傍晚',
-    '—— 致努力发光的你',
-    '—— 写在一个安静的午后',
-    '—— 给慢慢走路的你'
-  ];
-
-  const quoteEl = document.getElementById('daily-quote');
-  const signEl = document.getElementById('daily-quote-sign');
-  if (!quoteEl) return;
-
-  const now = new Date();
-  const seed = now.getFullYear() * 372 + (now.getMonth() + 1) * 31 + now.getDate();
-  quoteEl.textContent = QUOTES[seed % QUOTES.length];
-  if (signEl) signEl.textContent = SIGNS[seed % SIGNS.length];
+  const el = document.getElementById('hero-quote');
+  if (!el) return;
+  el.textContent = QUOTES[Math.floor(Math.random() * QUOTES.length)];
 })();
 </script>
-<script src="auth.js?v=20261105c"></script>
+<script src="auth.js?v=20261106d"></script>
 </body>
 </html>

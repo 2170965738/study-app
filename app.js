@@ -22,6 +22,8 @@ const uid = () => Date.now().toString(36).slice(-4) + Math.random().toString(36)
 function todayStr(d = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+// 统一日期键：所有任务日期都存成 YYYY-MM-DD，避免时间戳/时区字符串导致过滤失败
+const dateOnly = s => String(s == null ? '' : s).slice(0, 10);
 function parseDate(s) {
   const [y, m, d] = String(s).split('-').map(Number);
   return new Date(y, m - 1, d);
@@ -77,6 +79,7 @@ const DEFAULT = {
 // 旧数据的 spent 字段迁移为 actualSeconds；导入旧备份也走这里
 function normTask(t) {
   const out = Object.assign({}, t);
+  out.date = dateOnly(out.date);
   if (out.actualSeconds == null) out.actualSeconds = Number(t.spent) || 0;
   out.actualSeconds = Number(out.actualSeconds) || 0;
   out.run = Number(out.run) || 0;
@@ -112,6 +115,7 @@ function load() {
   return st;
 }
 let state = load();
+let taskDatePicked = false; // 用户是否手动改过“添加任务”的日期
 
 /* ===== 云端同步（任务 / 课表 / 健身） ===== */
 const FIT_OWNER_KEY = 'studyhub.fitnessOwner'; // 记住本机健身数据属于哪个账号，防止串号上传
@@ -124,6 +128,8 @@ const cloud = {
   pushTimer: 0,
   pullTimer: 0,
   pullPending: false,
+  taskMutating: 0,
+  mutationSeq: 0,
   fitnessWarned: false
 };
 
@@ -165,7 +171,7 @@ function taskToRow(t, uid) {
     user_id: uid,
     name: t.name,
     cat: t.cat || 'other',
-    task_date: t.date,
+    task_date: dateOnly(t.date),
     start_time: t.start || null,
     end_time: t.end || null,
     priority: Number(t.priority) || 2,
@@ -179,7 +185,7 @@ function rowToTask(r) {
     id: r.id,
     name: r.name,
     cat: r.cat || 'other',
-    date: r.task_date,
+    date: dateOnly(r.task_date),
     start: r.start_time ? String(r.start_time).slice(0, 5) : '',
     end: r.end_time ? String(r.end_time).slice(0, 5) : '',
     priority: Number(r.priority) || 2,
@@ -274,6 +280,157 @@ async function ensureCloudUser() {
   }
 }
 
+function beginTaskMutation() {
+  cloud.taskMutating++;
+  cloud.mutationSeq++;
+}
+
+function endTaskMutation() {
+  cloud.taskMutating = Math.max(0, cloud.taskMutating - 1);
+  if (cloud.taskMutating) return;
+  if (cloud.pendingPush) {
+    cloud.pendingPush = false;
+    schedulePush();
+    // 让下一次 push 的 finally 处理 pullPending，避免 push 未完成就被拉取覆盖
+    return;
+  }
+  if (cloud.pullPending) {
+    cloud.pullPending = false;
+    pullCloud();
+  }
+}
+
+function waitForPushIdle() {
+  if (!cloud.pushing) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setInterval(() => {
+      if (!cloud.pushing) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 50);
+  });
+}
+
+// 添加任务：本地先渲染，再显式 insert 云端，成功后用服务端返回行回写 state.tasks
+async function addTask(task) {
+  if (!task) return null;
+  const manual = !!task.dateManual;
+  const rawDate = dateOnly(task.date);
+  const date = manual && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : todayStr();
+  delete task.dateManual;
+  task.date = date;
+  state.ui.taskDate = date; // 任务列表切到新增任务的日期，添加后立即可见
+  console.log('--- 添加任务（已规整日期）---', task);
+
+  beginTaskMutation();
+  try {
+    state.tasks.push(task);
+    saveLocal();
+    renderDash();
+    renderTasks();
+    renderHeatmap();
+
+    if (!cloud.user) await ensureCloudUser();
+    if (!cloud.client || !cloud.user) {
+      if (task.date !== todayStr()) syncToast(`任务已保存到 ${task.date}，仪表盘只显示今天的任务`);
+      return task;
+    }
+
+    await waitForPushIdle(); // 等旧 push 结束，避免它的删除阶段把刚插入的任务删掉
+    const { data, error } = await cloud.client
+      .from('tasks')
+      .insert(taskToRow(task, cloud.user.id))
+      .select();
+    if (error) throw error;
+
+    const savedRow = Array.isArray(data) && data.length ? data[0] : null;
+    if (savedRow) {
+      const saved = rowToTask(savedRow);
+      const i = state.tasks.findIndex(x => x.id === task.id);
+      const current = i >= 0 ? state.tasks[i] : task;
+      const merged = Object.assign({}, saved, {
+        run: current.run || 0,
+        actualSeconds: Number(current.actualSeconds) || 0
+      });
+      if (i >= 0) state.tasks[i] = merged;
+      else state.tasks.push(merged);
+    }
+    saveLocal();
+    renderDash();
+    renderTasks();
+    renderHeatmap();
+    syncToast('任务已同步到云端' +
+      (task.date === todayStr() ? '' : `（日期 ${task.date}，非今天）`));
+    return state.tasks.find(x => x.id === task.id) || task;
+  } catch (err) {
+    console.error('[task] add failed', err);
+    state.tasks = state.tasks.filter(x => x.id !== task.id);
+    saveLocal();
+    renderDash();
+    renderTasks();
+    renderHeatmap();
+    const extra = [err && err.message, err && err.code, err && err.hint].filter(Boolean).join(' · ');
+    syncError('任务添加失败：' + (extra || '请检查网络或 RLS'));
+    syncToast('任务添加失败：' + (extra || '请检查网络或 RLS'));
+    return null;
+  } finally {
+    endTaskMutation();
+  }
+}
+
+// 删除任务：先锁定拉取，再本地移除 + 云端 delete，失败则回滚
+async function deleteTask(task) {
+  if (!task) return false;
+  const index = state.tasks.findIndex(x => x.id === task.id);
+  if (index < 0) return false;
+
+  const prevFocus = state.focus ? { ...state.focus } : null;
+  beginTaskMutation();
+  try {
+    if (task.run) pauseTimer(task);
+    state.tasks.splice(index, 1);
+    if (state.focus && state.focus.taskId === task.id) state.focus = null;
+    saveLocal();
+    renderDash();
+    renderTasks();
+    renderFocus();
+    renderHeatmap();
+
+    if (!cloud.user) await ensureCloudUser();
+    if (!cloud.client || !cloud.user) {
+      syncToast('任务已在本地删除');
+      return true;
+    }
+
+    await waitForPushIdle(); // 等旧 push 结束，避免它把刚删的任务又 upsert 回来
+    const { error } = await cloud.client
+      .from('tasks')
+      .delete()
+      .eq('id', task.id)
+      .eq('user_id', cloud.user.id);
+    if (error) throw error;
+
+    syncToast('任务已从云端删除');
+    return true;
+  } catch (err) {
+    console.error('[task] delete failed', err);
+    state.tasks.push(task);
+    if (prevFocus) state.focus = prevFocus;
+    saveLocal();
+    renderDash();
+    renderTasks();
+    renderFocus();
+    renderHeatmap();
+    const extra = [err && err.message, err && err.code, err && err.hint].filter(Boolean).join(' · ');
+    syncError('任务删除失败：' + (extra || '请检查网络或 RLS'));
+    syncToast('任务删除失败：' + (extra || '请检查网络或 RLS'));
+    return false;
+  } finally {
+    endTaskMutation();
+  }
+}
+
 function schedulePush() {
   if (!cloud.client || !cloud.user) {
     console.warn('[sync] skip push：未登录或客户端未就绪', {
@@ -288,6 +445,7 @@ function schedulePush() {
 
 async function pushCloud() {
   if (!cloud.client || !cloud.user) return;
+  if (cloud.taskMutating) { cloud.pendingPush = true; return; }
   if (cloud.pushing) { cloud.pendingPush = true; return; }
   cloud.pushing = true;
   const uid = cloud.user.id;
@@ -372,7 +530,9 @@ async function pushCloud() {
 
 async function pullCloud(forceRender) {
   if (!cloud.client || !cloud.user) return;
+  if (cloud.taskMutating) { cloud.pullPending = true; return; }
   const uid = cloud.user.id;
+  const seq = cloud.mutationSeq;
   try {
     const [tRes, cRes, fRes] = await Promise.all([
       cloud.client.from('tasks').select('*').eq('user_id', uid).order('created_at', { ascending: true }),
@@ -381,6 +541,12 @@ async function pullCloud(forceRender) {
     ]);
     if (tRes.error) throw tRes.error;
     if (cRes.error) throw cRes.error;
+
+    // 拉取过程中如果开始了任务增删，丢弃这次旧快照，避免覆盖本地新状态
+    if (cloud.taskMutating || seq !== cloud.mutationSeq) {
+      cloud.pullPending = true;
+      return;
+    }
 
     // 健身表缺失 / RLS 未配置时，只提示健身，不拖垮任务和课表的同步
     const fitnessOk = !fRes.error;
@@ -475,7 +641,7 @@ async function migrateLocalToCloud(uid) {
 }
 
 function onRemoteChange() {
-  if (cloud.pushing) { cloud.pullPending = true; return; }
+  if (cloud.pushing || cloud.taskMutating) { cloud.pullPending = true; return; }
   clearTimeout(cloud.pullTimer);
   cloud.pullTimer = setTimeout(() => pullCloud(), 900);
 }
@@ -497,6 +663,7 @@ function handleAuthUser(user) {
   cloud.user = user || null;
   if (!user) {
     if (cloud.client && cloud.channel) { cloud.client.removeChannel(cloud.channel); cloud.channel = null; }
+    onMoodAuth(null);
     return;
   }
   if (prevId !== user.id) {
@@ -504,6 +671,7 @@ function handleAuthUser(user) {
     cloud.fitnessWarned = false;
     pullCloud(true);
     subscribeRealtime();
+    onMoodAuth(user);
   }
 }
 
@@ -534,6 +702,236 @@ function initCloud() {
 
 // 手动排查用：控制台执行 await studyhubSync.push() / pull()
 window.studyhubSync = { push: pushCloud, pull: pullCloud, state: () => state, cloud: () => cloud };
+
+/* ===== 心情树洞（moods 表：全部记录） ===== */
+const MOOD_TEXT_MAX = 120;
+let moodRows = [];
+let moodSeq = 0; // 增删期间丢弃迟到的旧查询结果
+
+const moodCacheKey = uid => 'studyhub.moods.' + uid;
+
+function moodClient() {
+  return cloud.client || window.studyhubClient || null;
+}
+
+// 按账号缓存全部记录，刷新页面时先显示缓存，再等云端覆盖
+function moodCacheRead(uid) {
+  try {
+    const rows = JSON.parse(localStorage.getItem(moodCacheKey(uid)) || '[]');
+    return Array.isArray(rows) ? rows.filter(r => r && r.content) : [];
+  } catch (e) {
+    return [];
+  }
+}
+function moodCacheWrite(uid, rows) {
+  if (!uid) return;
+  try { localStorage.setItem(moodCacheKey(uid), JSON.stringify(rows || [])); }
+  catch (e) { /* 隐私模式或配额不足时忽略 */ }
+}
+
+function moodTimeText(iso) {
+  const d = new Date(iso);
+  if (!iso || isNaN(d.getTime())) return '';
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const day = todayStr(d);
+  if (day === todayStr()) return `今天 ${hm}`;
+  if (day === addDays(todayStr(), -1)) return `昨天 ${hm}`;
+  return `${d.getMonth() + 1} 月 ${d.getDate()} 日 ${hm}`;
+}
+
+function moodMsg(text, ok) {
+  const el = $('mood-msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
+}
+
+function moodErrorText(err) {
+  const msg = (err && err.message) || '未知错误';
+  if (/relation .*moods.* does not exist|Could not find the table|schema cache/i.test(msg)) {
+    return 'moods 表还没建好：先在 Supabase SQL Editor 执行 supabase-moods.sql';
+  }
+  if (/row-level security|permission denied|violates row-level/i.test(msg)) {
+    return '心情表权限不足：请检查 moods 表的 RLS 策略';
+  }
+  if (/Failed to fetch|NetworkError|Load failed|fetch/i.test(msg)) {
+    return '无法连接云端，请检查网络后再试';
+  }
+  return '操作失败：' + msg;
+}
+
+function renderMoods() {
+  const list = $('mood-list');
+  if (!list) return;
+  const count = $('mood-count');
+  if (count) count.textContent = `${moodRows.length} 条`;
+  const sub = $('mood-sub');
+  if (sub) {
+    sub.textContent = cloud.user
+      ? '今天的情绪，也值得被轻轻记下来。'
+      : '登录后，可以把心情说给树洞听。';
+  }
+  if (!moodRows.length) {
+    list.innerHTML = `<li class="mood-empty">${cloud.user ? '还没有记录，写下第一条碎碎念吧 🌿' : '登录后即可查看你的碎碎念'}</li>`;
+    return;
+  }
+  list.innerHTML = moodRows.map(m => `<li class="mood-item">
+      <p class="mood-text">${esc(m.content)}</p>
+      <div class="mood-foot">
+        <span class="mood-time">${esc(moodTimeText(m.created_at))}</span>
+        <button class="mood-del" type="button" data-mood-del="${esc(m.id)}" title="删除这条记录" aria-label="删除这条心情">×</button>
+      </div>
+    </li>`).join('');
+}
+
+async function loadMoods() {
+  const uid = cloud.user && cloud.user.id;
+  if (!uid) {
+    moodRows = [];
+    renderMoods();
+    return;
+  }
+  moodRows = moodCacheRead(uid);
+  renderMoods();
+
+  const client = moodClient();
+  if (!client) return;
+  const seq = moodSeq;
+  try {
+    const { data, error } = await client.from('moods')
+      .select('id, content, created_at')
+      .eq('user_id', uid)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    if (seq !== moodSeq) return; // 查询期间发生了增删，丢弃这份旧快照
+    if (!cloud.user || cloud.user.id !== uid) return; // 请求期间切换了账号
+    moodRows = Array.isArray(data) ? data : [];
+    moodCacheWrite(uid, moodRows);
+    renderMoods();
+    moodMsg('');
+  } catch (err) {
+    console.warn('[mood] load failed', err);
+    if (!moodRows.length) moodMsg(moodErrorText(err));
+  }
+}
+
+async function addMood(raw) {
+  const content = String(raw || '').trim().slice(0, MOOD_TEXT_MAX);
+  if (!content) { moodMsg('先写一句心情再记录哦'); return; }
+  const btn = $('mood-submit');
+  if (btn && btn.disabled) return;
+
+  if (!cloud.user) await ensureCloudUser();
+  if (!cloud.user) { moodMsg('登录后才能把心情写进树洞'); return; }
+  const client = moodClient();
+  if (!client) { moodMsg('云端还没连上，稍后再试'); return; }
+  const uid = cloud.user.id;
+
+  moodSeq++;
+  if (btn) btn.disabled = true;
+  moodMsg('正在记录…');
+  try {
+    const { data, error } = await client.from('moods')
+      .insert({ user_id: uid, content })
+      .select('id, content, created_at')
+      .single();
+    if (error) throw error;
+    if (!data) throw new Error('云端没有返回这条记录');
+    if (!cloud.user || cloud.user.id !== uid) return;
+
+    moodRows = [data].concat(moodRows.filter(m => String(m.id) !== String(data.id)));
+    moodCacheWrite(uid, moodRows);
+    const input = $('mood-input');
+    if (input) input.value = '';
+    renderMoods();
+    moodMsg('已经收好啦 🌱', true);
+    syncToast('心情已收进树洞');
+  } catch (err) {
+    console.error('[mood] insert failed', err);
+    const text = moodErrorText(err);
+    moodMsg(text);
+    syncError(text);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function deleteMood(id) {
+  const index = moodRows.findIndex(m => String(m.id) === String(id));
+  if (index < 0) return;
+  if (!confirm('删除这条心情记录？')) return;
+
+  const row = moodRows[index];
+  const backup = moodRows.slice();
+  moodSeq++;
+  moodRows = moodRows.filter((_, i) => i !== index);
+  renderMoods();
+
+  if (!cloud.user) await ensureCloudUser();
+  const client = moodClient();
+  if (!cloud.user || !client) {
+    moodRows = backup;
+    renderMoods();
+    moodMsg('登录后才能删除心情');
+    return;
+  }
+  const uid = cloud.user.id;
+  try {
+    const { error } = await client.from('moods').delete().eq('id', row.id).eq('user_id', uid);
+    if (error) throw error;
+    moodCacheWrite(uid, moodRows);
+    moodMsg('已删除', true);
+  } catch (err) {
+    console.error('[mood] delete failed', err);
+    moodRows = backup;
+    renderMoods();
+    const text = moodErrorText(err);
+    moodMsg(text);
+    syncError(text);
+  }
+}
+
+// 登录状态变化时由 handleAuthUser 调用
+function onMoodAuth(user) {
+  if (!user) {
+    moodRows = [];
+    renderMoods();
+    moodMsg('');
+    return;
+  }
+  loadMoods();
+}
+
+function initMoods() {
+  const form = $('mood-form');
+  const list = $('mood-list');
+  if (!form || !list) return;
+
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    addMood($('mood-input').value);
+  });
+
+  const input = $('mood-input');
+  if (input) {
+    input.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        addMood(input.value);
+      }
+    });
+  }
+
+  list.addEventListener('click', e => {
+    const btn = e.target.closest('[data-mood-del]');
+    if (btn) deleteMood(btn.dataset.moodDel);
+  });
+
+  renderMoods();
+}
+
+window.studyhubMoods = { reload: loadMoods, add: addMood };
+
 
 /* ===== 空闲时段 ===== */
 function busyBlocks(dateStr) {
@@ -702,27 +1100,55 @@ function slotsHtml(list) {
 
 function taskRow(t) {
   const cat = CATS[t.cat] || '其他';
-  const timeText = t.start && t.end ? `${t.start}–${t.end}` : '未排时间';
+  const timeText = t.start && t.end ? `${t.start}–${t.end}` : '';
   const running = !!t.run;
   const focusing = !!state.focus && state.focus.taskId === t.id;
   const used = elapsed(t);
   const started = running || used > 0;
+  const showActual = used > 0 || running;
   return `<li class="${t.done ? 'done' : ''} ${running ? 'running' : ''} ${focusing ? 'focusing' : ''}">
     <input type="checkbox" data-act="done" data-id="${t.id}" ${t.done ? 'checked' : ''}>
     <div class="t-main">
       <div class="t-name"><span class="tag cat-${esc(t.cat || 'other')}">${cat}</span>${esc(t.name)}
         <span class="pri ${Number(t.priority) === 1 ? 'high' : ''}">${PRI_TEXT[Number(t.priority)] || '中'}</span></div>
       <div class="t-meta">
-        <span>${timeText}</span>
+        ${timeText ? `<span>${timeText}</span>` : ''}
         <span>计划 ${Number(t.est) || 60} 分</span>
-        <span>实际用时 <em data-actual="${t.id}">${hms(used)}</em></span>
+        ${showActual ? `<span>实际用时 <em data-actual="${t.id}">${hms(used)}</em></span>` : ''}
       </div>
     </div>
-    <span class="timer ${running ? 'running' : ''}" data-timer="${t.id}">${hms(used)}</span>
+    ${showActual ? `<span class="timer ${running ? 'running' : ''}" data-timer="${t.id}">${hms(used)}</span>` : ''}
     <div class="t-actions">
       ${t.done ? '' : `<button data-act="${running ? 'pause' : 'start'}" data-id="${t.id}">${running ? '⏸ 暂停' : (started ? '▶ 继续专注' : '▶ 开始专注')}</button>`}
       ${running ? `<button data-act="stop" data-id="${t.id}">⏹ 结束</button>` : ''}
       <button class="del" data-act="del-task" data-id="${t.id}">删除</button>
+    </div>
+  </li>`;
+}
+
+// 仪表盘专用：单行紧凑任务行
+function compactTaskRow(t) {
+  const cat = CATS[t.cat] || '其他';
+  const running = !!t.run;
+  const focusing = !!state.focus && state.focus.taskId === t.id;
+  const used = elapsed(t);
+  const started = running || used > 0;
+  const prio = Number(t.priority) || 2;
+  const prioCls = prio === 1 ? 'prio-high' : prio === 3 ? 'prio-low' : 'prio-mid';
+  const timeText = t.start && t.end ? `${t.start}–${t.end}` : '';
+  return `<li class="compact ${prioCls} ${t.done ? 'done' : ''} ${running ? 'running' : ''} ${focusing ? 'focusing' : ''}">
+    <input type="checkbox" data-act="done" data-id="${t.id}" ${t.done ? 'checked' : ''}>
+    <div class="t-main">
+      <div class="t-name">
+        <span class="tag cat-${esc(t.cat || 'other')}">${cat}</span>
+        <span class="t-title" title="${esc(t.name)}">${esc(t.name)}</span>
+      </div>
+    </div>
+    ${timeText ? `<span class="t-time">${timeText}</span>` : ''}
+    <div class="t-actions">
+      ${t.done ? '' : `<button data-act="${running ? 'pause' : 'start'}" data-id="${t.id}" title="${running ? '暂停' : (started ? '继续专注' : '开始专注')}">${running ? '⏸' : '▶'}</button>`}
+      ${running ? `<button data-act="stop" data-id="${t.id}" title="结束">⏹</button>` : ''}
+      <button class="del" data-act="del-task" data-id="${t.id}" title="删除">×</button>
     </div>
   </li>`;
 }
@@ -733,7 +1159,7 @@ function renderDash() {
   $('d-date').textContent = `${now.getMonth() + 1} 月 ${now.getDate()} 日`;
   $('d-week').textContent = `${now.getFullYear()} 年 · ${WEEKDAYS[weekdayOf(today) - 1]}`;
 
-  const todays = state.tasks.filter(t => t.date === today);
+  const todays = state.tasks.filter(t => dateOnly(t.date) === today);
   const doneCount = todays.filter(t => t.done).length;
   $('d-tasks').textContent = `${doneCount}/${todays.length}`;
   $('d-study').textContent = durText(todayStudySec());
@@ -746,7 +1172,7 @@ function renderDash() {
 
   $('d-free').innerHTML = slotsHtml(freeSlots(today));
   $('d-tasklist').innerHTML = todays.length
-    ? todays.slice().sort((a, b) => (a.done - b.done) || (toMin(a.start) ?? 9999) - (toMin(b.start) ?? 9999)).map(taskRow).join('')
+    ? todays.slice().sort((a, b) => (a.done - b.done) || (toMin(a.start) ?? 9999) - (toMin(b.start) ?? 9999)).map(t => compactTaskRow(t)).join('')
     : '<li class="empty muted" style="border-style:dashed;">今天还没有任务，去「任务」里添加</li>';
 }
 
@@ -791,12 +1217,13 @@ function renderCourses() {
 
 /* ===== 渲染：任务 ===== */
 function renderTasks() {
-  const date = state.ui.taskDate || todayStr();
+  const date = dateOnly(state.ui.taskDate || todayStr());
   $('task-date').value = date;
-  $('task-form').elements.date.value = date;
+  const dateInput = $('task-form').elements.date;
+  if (!taskDatePicked || !dateInput.value) dateInput.value = todayStr();
   $('focus-min').value = Number(state.ui.focusMin) || 25;
 
-  const list = state.tasks.filter(t => t.date === date).sort((a, b) =>
+  const list = state.tasks.filter(t => dateOnly(t.date) === date).sort((a, b) =>
     (a.done - b.done) ||
     ((toMin(a.start) ?? 9999) - (toMin(b.start) ?? 9999)) ||
     (CAT_RANK[a.cat] ?? 3) - (CAT_RANK[b.cat] ?? 3) ||
@@ -913,6 +1340,99 @@ function renderCountdown() {
   document.querySelectorAll('[data-cd]').forEach(el => { el.textContent = cdText(state.exams[el.dataset.cd]); });
 }
 
+/* ===== 学习足迹（最近 12 周热力图） ===== */
+let heatToday = '';
+let heatTodayMin = -1;
+
+function dailyStudySeconds() {
+  const map = {};
+  for (const t of state.tasks) {
+    const sec = elapsed(t);
+    if (sec > 0) map[t.date] = (map[t.date] || 0) + sec;
+  }
+  return map;
+}
+
+function heatMinute(sec) {
+  return sec > 0 ? Math.max(1, Math.round(sec / 60)) : 0;
+}
+
+function heatLevel(min) {
+  if (min <= 0) return 0;
+  if (min < 15) return 1;
+  if (min < 30) return 2;
+  if (min < 60) return 3;
+  return 4;
+}
+
+function heatTip(date, min) {
+  return `${Number(date.slice(5, 7))}月${Number(date.slice(8, 10))}日，专注了${min}分钟`;
+}
+
+// 从 11 周前的周一开始，7 行正好对应周一到周日
+function heatmapStart(today) {
+  return addDays(today, -(weekdayOf(today) - 1) - 77);
+}
+
+function refreshHeatSummary(byDate, start, today) {
+  const summary = $('heatmap-summary');
+  if (!summary) return;
+  byDate = byDate || dailyStudySeconds();
+  today = today || todayStr();
+  start = start || heatmapStart(today);
+  let totalSec = 0;
+  let activeDays = 0;
+  for (let i = 0; i < 84; i++) {
+    const date = addDays(start, i);
+    if (date > today) continue;
+    const sec = byDate[date] || 0;
+    if (sec > 0) {
+      activeDays++;
+      totalSec += sec;
+    }
+  }
+  summary.textContent = `最近 12 周 · 学习 ${activeDays} 天 · 累计 ${hoursText(Math.round(totalSec / 60))}`;
+}
+
+function renderHeatmap() {
+  const grid = $('heatmap');
+  if (!grid) return;
+  const today = todayStr();
+  const start = heatmapStart(today);
+  const byDate = dailyStudySeconds();
+  let html = '';
+  for (let i = 0; i < 84; i++) {
+    const date = addDays(start, i);
+    if (date > today) {
+      html += `<div class="heat-cell heat-future" data-heat-date="${date}" aria-hidden="true"></div>`;
+      continue;
+    }
+    const min = heatMinute(byDate[date] || 0);
+    const tip = heatTip(date, min);
+    html += `<div class="heat-cell heat-${heatLevel(min)}" data-heat-date="${date}" title="${tip}" aria-label="${tip}"></div>`;
+  }
+  grid.innerHTML = html;
+  heatToday = today;
+  heatTodayMin = heatMinute(byDate[today] || 0);
+  refreshHeatSummary(byDate, start, today);
+}
+
+// 秒级刷新时只改“今天”这格，避免整张图重建
+function updateHeatmapToday() {
+  const today = todayStr();
+  if (heatToday !== today) { renderHeatmap(); return; }
+  const cell = document.querySelector(`[data-heat-date="${today}"]`);
+  if (!cell) return;
+  const min = heatMinute(todayStudySec(today));
+  if (min === heatTodayMin) return;
+  heatTodayMin = min;
+  cell.className = 'heat-cell heat-' + heatLevel(min);
+  const tip = heatTip(today, min);
+  cell.title = tip;
+  cell.setAttribute('aria-label', tip);
+  refreshHeatSummary();
+}
+
 /* ===== 渲染：全部 ===== */
 function renderAll() {
   renderDash();
@@ -920,6 +1440,7 @@ function renderAll() {
   renderTasks();
   renderFitness();
   renderCountdown();
+  renderHeatmap();
   renderFocus();
 }
 
@@ -965,6 +1486,8 @@ function liveUpdate() {
       }
     }
   }
+
+  updateHeatmapToday();
 }
 
 /* ===== 排程建议（贪心） ===== */
@@ -1064,6 +1587,7 @@ $('tabs').addEventListener('click', e => {
   state.ui.tab = btn.dataset.tab;
   save();
   switchTab();
+  renderActiveTab();
 });
 
 function switchTab() {
@@ -1074,6 +1598,32 @@ function switchTab() {
     try { history.replaceState(null, '', hash); } catch (e) { /* file:// 下可能被限制 */ }
   }
 }
+
+// 切回某个标签时重新渲染它，确保拿到最新的 state.tasks / moods
+function renderActiveTab() {
+  if (state.ui.tab === 'dash') {
+    renderDash();
+    renderHeatmap();
+  } else if (state.ui.tab === 'courses') {
+    renderCourses();
+  } else if (state.ui.tab === 'tasks') {
+    renderTasks();
+  } else if (state.ui.tab === 'fitness') {
+    renderFitness();
+  } else if (state.ui.tab === 'mood') {
+    loadMoods();
+  }
+}
+
+// 手动改 hash / 浏览器前进后退时也同步刷新
+window.addEventListener('hashchange', () => {
+  const tab = (location.hash || '').replace('#', '');
+  if (!['dash', 'courses', 'tasks', 'fitness', 'mood'].includes(tab) || tab === state.ui.tab) return;
+  state.ui.tab = tab;
+  save();
+  switchTab();
+  renderActiveTab();
+});
 
 /* ===== 事件：表单 ===== */
 $('task-form').addEventListener('submit', e => {
@@ -1090,17 +1640,19 @@ $('task-form').addEventListener('submit', e => {
     start, end,
     priority: Number(el.priority.value) || 2,
     est: Number(el.est.value) || 60,
+    dateManual: taskDatePicked,
     done: false, actualSeconds: 0, run: 0
   };
-  console.log('--- 触发了添加任务 ---', payload);
-  state.tasks.push(payload);
-  save();
-  console.log('[sync] save() 完成，cloud.user =', cloud.user && cloud.user.email, 'client =', !!cloud.client);
+  addTask(payload);
   f.reset();
   el.date.value = state.ui.taskDate || todayStr();
   el.est.value = 60;
   el.priority.value = '2';
-  renderAll();
+});
+
+// 用户手动改过添加日期后，才允许任务落到非今天
+['input', 'change'].forEach(evt => {
+  $('task-form').elements.date.addEventListener(evt, () => { taskDatePicked = true; });
 });
 
 $('course-form').addEventListener('submit', e => {
@@ -1127,7 +1679,15 @@ $('course-form').addEventListener('submit', e => {
 });
 
 $('task-date').addEventListener('change', e => {
-  state.ui.taskDate = e.target.value || todayStr();
+  const d = e.target.value || todayStr();
+  state.ui.taskDate = d;
+  if (e.target.value) {
+    taskDatePicked = true;
+    $('task-form').elements.date.value = d;
+  } else {
+    taskDatePicked = false;
+    $('task-form').elements.date.value = todayStr();
+  }
   save();
   $('suggest-box').classList.add('hidden');
   renderTasks();
@@ -1136,6 +1696,7 @@ $('task-date').addEventListener('change', e => {
 
 $('btn-today').addEventListener('click', () => {
   state.ui.taskDate = todayStr();
+  taskDatePicked = false;
   save();
   renderTasks();
   renderDash();
@@ -1253,11 +1814,7 @@ document.addEventListener('click', e => {
   else if (act === 'pause') pauseTaskTimer(t);
   else if (act === 'stop') endTaskTimer(t);
   else if (act === 'del-task') {
-    if (confirm(`删除任务「${t.name}」？`)) {
-      if (state.focus && state.focus.taskId === t.id) state.focus = null;
-      state.tasks = state.tasks.filter(x => x.id !== t.id);
-      save(); renderAll();
-    }
+    if (confirm(`删除任务「${t.name}」？`)) deleteTask(t);
   }
 });
 
@@ -1283,19 +1840,72 @@ $('week-grid').addEventListener('click', e => {
   }
 });
 
+/* ===== 白噪音 ===== */
+(function initNoise() {
+  const audio = $('noise-audio');
+  const hint = $('noise-hint');
+  const buttons = Array.from(document.querySelectorAll('.noise-btn'));
+  if (!audio || !buttons.length) return;
+
+  let current = null;
+  const setHint = text => { if (hint) hint.textContent = text || ''; };
+  const markActive = btn => {
+    buttons.forEach(b => {
+      const on = b === btn;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  };
+  const stopNoise = () => {
+    audio.pause();
+    current = null;
+    markActive(null);
+    setHint('');
+  };
+  const playNoise = btn => {
+    if (current === btn && !audio.paused) { stopNoise(); return; }
+    const src = btn.dataset.src;
+    if (!src) return;
+    if (audio.getAttribute('src') !== src) audio.src = src;
+    audio.volume = 0.45;
+    const playing = audio.play();
+    if (playing && playing.catch) {
+      playing.catch(err => {
+        if (current !== btn) return;
+        console.warn('[noise] play failed', err);
+        setHint('音频加载失败，请检查网络或替换 data-src 链接');
+        current = null;
+        markActive(null);
+      });
+    }
+    current = btn;
+    markActive(btn);
+    setHint(`正在播放：${btn.dataset.name || ''}`);
+  };
+  buttons.forEach(btn => btn.addEventListener('click', () => playNoise(btn)));
+  audio.addEventListener('error', () => {
+    if (!current) return;
+    setHint('音频加载失败，请检查网络或替换 data-src 链接');
+    current = null;
+    markActive(null);
+  });
+})();
+
 /* ===== 启动 ===== */
 (function init() {
-  const TABS = ['dash', 'courses', 'tasks', 'fitness'];
+  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood'];
   const hashTab = (location.hash || '').replace('#', '');
   if (TABS.includes(hashTab)) state.ui.tab = hashTab;
   if (!TABS.includes(state.ui.tab)) state.ui.tab = 'dash'; // 旧存档可能停在已删除的倒计时页
-  if (!state.ui.taskDate) state.ui.taskDate = todayStr();
+  state.ui.taskDate = todayStr();
+  taskDatePicked = false;
   if (!Number(state.ui.focusMin)) state.ui.focusMin = 25;
   // 专注会话指向的任务被删除/已完成时清理
   if (state.focus && !state.tasks.some(t => t.id === state.focus.taskId && !t.done)) state.focus = null;
   fitToday = todayStr();
   switchTab();
   renderAll();
+  initMoods();
   save(); // 持久化一次性迁移标记
   initCloud();
   liveUpdate();
