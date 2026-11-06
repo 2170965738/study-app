@@ -195,6 +195,151 @@ function rowToTask(r) {
     run: 0
   };
 }
+
+/* ===== 每天重复 & 子任务（只存本机，不新增云端字段） ===== */
+const openSubtasks = new Set();
+
+function recurringDefs() {
+  if (!Array.isArray(state.ui.recurring)) state.ui.recurring = [];
+  return state.ui.recurring;
+}
+
+// 重复设置按账号隔离，避免换账号后把别人的重复任务带到新账号
+function recurringOwner() {
+  const user = (cloud.user && cloud.user.id) || (window.studyhubUser && window.studyhubUser.id);
+  return user || 'local';
+}
+
+function recurringInstanceId(defId, date) {
+  return 'ri_' + defId + '_' + dateOnly(date);
+}
+
+function recurringDefIdOfTask(task) {
+  if (!task) return '';
+  if (task.recurId) return String(task.recurId);
+  const match = /^ri_(rec_[a-z0-9]+)_(\d{4}-\d{2}-\d{2})$/.exec(String(task.id || ''));
+  return match ? match[1] : '';
+}
+
+function recurringDefForTask(task) {
+  const id = recurringDefIdOfTask(task);
+  if (!id) return null;
+  return recurringDefs().find(def => def && def.id === id) || null;
+}
+
+function recurringTaskOf(def, date) {
+  return {
+    id: recurringInstanceId(def.id, date),
+    recurId: def.id,
+    name: def.name,
+    cat: def.cat || 'other',
+    date,
+    start: def.start || '',
+    end: def.end || '',
+    priority: Number(def.priority) || 2,
+    est: Number(def.est) || 60,
+    done: false,
+    actualSeconds: 0,
+    run: 0
+  };
+}
+
+// 每天/跨天时补齐当天实例；返回本次新增数量，由调用方决定什么时候 save
+function ensureRecurringInstances() {
+  const defs = recurringDefs();
+  if (!defs.length) return 0;
+  const today = todayStr();
+  const owner = recurringOwner();
+  let added = 0;
+
+  for (const def of defs) {
+    if (!def || !def.id || !def.name) continue;
+    if ((def.owner || 'local') !== owner) continue;
+    if (def.startDate && today < def.startDate) continue;
+    if (Array.isArray(def.skipped) && def.skipped.includes(today)) continue;
+    if (state.tasks.some(t => t.id === recurringInstanceId(def.id, today))) continue;
+    state.tasks.push(recurringTaskOf(def, today));
+    added++;
+  }
+  return added;
+}
+
+// 删除某一天的任务时记一笔，避免当天又被自动补回来；只清理 60 天前的记录
+function skipRecurringDate(task) {
+  const def = recurringDefForTask(task);
+  if (!def) return;
+  const date = dateOnly(task.date) || todayStr();
+  def.skipped = Array.isArray(def.skipped) ? def.skipped : [];
+  if (!def.skipped.includes(date)) def.skipped.push(date);
+  const cutoff = addDays(todayStr(), -60);
+  def.skipped = def.skipped.filter(d => d >= cutoff);
+}
+
+function stopRecurring(task) {
+  const def = recurringDefForTask(task);
+  if (!def) return false;
+  const defs = recurringDefs();
+  const index = defs.findIndex(d => d && d.id === def.id);
+  if (index < 0) return false;
+  defs.splice(index, 1);
+  return true;
+}
+
+// 登录前创建的“本机重复任务”，第一次登录时归到当前账号，避免登录后失效
+function claimLocalRecurringDefs(userId) {
+  if (!userId || userId === 'local') return 0;
+  let claimed = 0;
+  for (const def of recurringDefs()) {
+    if (def && (def.owner || 'local') === 'local') {
+      def.owner = userId;
+      claimed++;
+    }
+  }
+  return claimed;
+}
+
+function subtasksOf(taskId) {
+  if (!state.ui.subtasks || typeof state.ui.subtasks !== 'object' || Array.isArray(state.ui.subtasks)) {
+    state.ui.subtasks = {};
+  }
+  const list = state.ui.subtasks[taskId];
+  return Array.isArray(list) ? list.filter(s => s && typeof s === 'object') : [];
+}
+
+function addSubtask(taskId, text) {
+  const value = String(text || '').trim().slice(0, 60);
+  if (!taskId || !value || !state.tasks.some(t => t.id === taskId)) return false;
+  const list = subtasksOf(taskId).slice();
+  list.push({ id: uid(), text: value, done: false });
+  state.ui.subtasks[taskId] = list;
+  openSubtasks.add(taskId);
+  saveLocal();
+  renderTasks();
+  requestAnimationFrame(() => {
+    const input = document.querySelector('[data-subtask-input="' + taskId + '"]');
+    if (input) input.focus();
+  });
+  return true;
+}
+
+function toggleSubtask(taskId, subId, done) {
+  const list = subtasksOf(taskId);
+  const sub = list.find(s => s && String(s.id) === String(subId));
+  if (!sub) return;
+  sub.done = !!done;
+  saveLocal();
+  renderTasks();
+}
+
+function deleteSubtask(taskId, subId) {
+  if (!state.ui.subtasks || !state.ui.subtasks[taskId]) return;
+  state.ui.subtasks[taskId] = subtasksOf(taskId)
+    .filter(s => s && String(s.id) !== String(subId));
+  if (!state.ui.subtasks[taskId].length) delete state.ui.subtasks[taskId];
+  saveLocal();
+  renderTasks();
+}
+
 function courseToRow(c, uid) {
   return {
     id: c.id,
@@ -386,10 +531,16 @@ async function deleteTask(task) {
   if (index < 0) return false;
 
   const prevFocus = state.focus ? { ...state.focus } : null;
+  const prevSubtasks = state.ui.subtasks && typeof state.ui.subtasks === 'object'
+    ? state.ui.subtasks[task.id]
+    : undefined;
   beginTaskMutation();
   try {
     if (task.run) pauseTimer(task);
+    skipRecurringDate(task);
+    openSubtasks.delete(task.id);
     state.tasks.splice(index, 1);
+    if (state.ui.subtasks && typeof state.ui.subtasks === 'object') delete state.ui.subtasks[task.id];
     if (state.focus && state.focus.taskId === task.id) state.focus = null;
     saveLocal();
     renderDash();
@@ -417,6 +568,9 @@ async function deleteTask(task) {
     console.error('[task] delete failed', err);
     state.tasks.push(task);
     if (prevFocus) state.focus = prevFocus;
+    if (prevSubtasks && state.ui.subtasks && typeof state.ui.subtasks === 'object') {
+      state.ui.subtasks[task.id] = prevSubtasks;
+    }
     saveLocal();
     renderDash();
     renderTasks();
@@ -608,9 +762,10 @@ async function pullCloud(forceRender) {
     state.courses = cloudCourses;
     state.workouts = mergedWorkouts;
     if (fitnessOk) localStorage.setItem(FIT_OWNER_KEY, uid);
+    const addedRecurring = ensureRecurringInstances(); // 云端快照里可能没有今天刚补的重复任务
     saveLocal();
-    if (changed || forceRender) renderAll();
-    if (needFitPush) schedulePush(); // 本机有、云端没有的打卡，拉取后补推
+    if (changed || forceRender || addedRecurring) renderAll();
+    if (needFitPush || addedRecurring) schedulePush(); // 本机有、云端没有的打卡/重复任务，拉取后补推
   } catch (err) {
     console.warn('[sync] pull failed', err);
     syncError('云端数据读取失败：' + (err.message || '请检查网络'));
@@ -668,8 +823,18 @@ function handleAuthUser(user) {
   }
   if (prevId !== user.id) {
     console.info('[sync] signed in as', user.id, user.email);
+    const signedInId = user.id;
+    if (claimLocalRecurringDefs(user.id)) saveLocal();
     cloud.fitnessWarned = false;
-    pullCloud(true);
+    pullCloud(true).then(() => {
+      // 拉取失败/被任务操作延后时，也保证今天的重复任务能出现
+      if (!cloud.user || cloud.user.id !== signedInId) return;
+      if (cloud.taskMutating) return;
+      if (ensureRecurringInstances() > 0) {
+        save();
+        renderAll();
+      }
+    });
     subscribeRealtime();
     onMoodAuth(user);
   }
@@ -1040,6 +1205,40 @@ function playFocusChime() {
   ctx.resume().then(() => { if (ctx.state === 'running') scheduleChime(ctx); }).catch(() => {});
 }
 
+/* ===== 专注结束系统通知（可选，不依赖任何外部服务） ===== */
+let notificationAsked = false;
+
+function ensureNotificationPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission !== 'default' || notificationAsked) return;
+  notificationAsked = true;
+  try {
+    const result = Notification.requestPermission();
+    if (result && typeof result.then === 'function') {
+      result.then(() => {}).catch(() => {});
+    }
+  } catch (e) {
+    console.warn('[focus] 通知权限申请失败', e);
+  }
+}
+
+function notifyFocusEnd(taskName) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    const note = new Notification('专注结束', {
+      body: '专注结束，快起来喝水休息一下吧！' + (taskName ? `\n刚才专注：${taskName}` : ''),
+      tag: 'studyhub-focus-end',
+      renotify: true,
+      silent: true
+    });
+    note.onclick = () => {
+      try { window.focus(); note.close(); } catch (e) { /* 忽略 */ }
+    };
+  } catch (e) {
+    console.warn('[focus] 系统通知失败', e);
+  }
+}
+
 function renderFocus() {
   const panel = $('focus-panel');
   if (!panel) return;
@@ -1054,6 +1253,7 @@ function renderFocus() {
 
 function startTaskTimer(t) {
   primeAudio(); // 借这次点击解锁音频，倒计时结束时才能响
+  ensureNotificationPermission(); // 借这次用户手势申请通知权限
   state.tasks.forEach(o => { if (o !== t && o.run) pauseTimer(o); });
   if (state.focus && state.focus.taskId === t.id) {
     t.run = Date.now(); // 继续本任务未结束的专注
@@ -1073,6 +1273,8 @@ function pauseTaskTimer(t) {
 function endTaskTimer(t) {
   pauseTimer(t);
   if (state.focus && state.focus.taskId === t.id) state.focus = null;
+  playFocusChime();                 // 倒计时自然结束 / 手动结束都响铃
+  notifyFocusEnd(t && t.name);      // 有通知权限时弹系统通知
   save(); renderAll();
 }
 
@@ -1106,23 +1308,44 @@ function taskRow(t) {
   const used = elapsed(t);
   const started = running || used > 0;
   const showActual = used > 0 || running;
-  return `<li class="${t.done ? 'done' : ''} ${running ? 'running' : ''} ${focusing ? 'focusing' : ''}">
-    <input type="checkbox" data-act="done" data-id="${t.id}" ${t.done ? 'checked' : ''}>
-    <div class="t-main">
-      <div class="t-name"><span class="tag cat-${esc(t.cat || 'other')}">${cat}</span>${esc(t.name)}
-        <span class="pri ${Number(t.priority) === 1 ? 'high' : ''}">${PRI_TEXT[Number(t.priority)] || '中'}</span></div>
-      <div class="t-meta">
-        ${timeText ? `<span>${timeText}</span>` : ''}
-        <span>计划 ${Number(t.est) || 60} 分</span>
-        ${showActual ? `<span>实际用时 <em data-actual="${t.id}">${hms(used)}</em></span>` : ''}
+  const repeatDef = recurringDefForTask(t);
+  const subs = subtasksOf(t.id);
+  const subDone = subs.filter(s => s.done).length;
+  const subOpen = openSubtasks.has(t.id) ? ' open' : '';
+  return `<li class="task-item ${t.done ? 'done' : ''} ${running ? 'running' : ''} ${focusing ? 'focusing' : ''}">
+    <div class="task-row">
+      <input type="checkbox" data-act="done" data-id="${t.id}" ${t.done ? 'checked' : ''}>
+      <div class="t-main">
+        <div class="t-name"><span class="tag cat-${esc(t.cat || 'other')}">${cat}</span>${esc(t.name)}
+          <span class="pri ${Number(t.priority) === 1 ? 'high' : ''}">${PRI_TEXT[Number(t.priority)] || '中'}</span>
+          ${repeatDef ? `<button class="repeat-chip" type="button" data-act="stop-repeat" data-id="${t.id}" title="每天重复 · 点击停止">🔁 每天</button>` : ''}</div>
+        <div class="t-meta">
+          ${timeText ? `<span>${timeText}</span>` : ''}
+          <span>计划 ${Number(t.est) || 60} 分</span>
+          ${showActual ? `<span>实际用时 <em data-actual="${t.id}">${hms(used)}</em></span>` : ''}
+        </div>
+      </div>
+      ${showActual ? `<span class="timer ${running ? 'running' : ''}" data-timer="${t.id}">${hms(used)}</span>` : ''}
+      <div class="t-actions">
+        ${t.done ? '' : `<button data-act="${running ? 'pause' : 'start'}" data-id="${t.id}">${running ? '⏸ 暂停' : (started ? '▶ 继续专注' : '▶ 开始专注')}</button>`}
+        ${running ? `<button data-act="stop" data-id="${t.id}">⏹ 结束</button>` : ''}
+        <button class="del" data-act="del-task" data-id="${t.id}">删除</button>
       </div>
     </div>
-    ${showActual ? `<span class="timer ${running ? 'running' : ''}" data-timer="${t.id}">${hms(used)}</span>` : ''}
-    <div class="t-actions">
-      ${t.done ? '' : `<button data-act="${running ? 'pause' : 'start'}" data-id="${t.id}">${running ? '⏸ 暂停' : (started ? '▶ 继续专注' : '▶ 开始专注')}</button>`}
-      ${running ? `<button data-act="stop" data-id="${t.id}">⏹ 结束</button>` : ''}
-      <button class="del" data-act="del-task" data-id="${t.id}">删除</button>
-    </div>
+    <details class="subtasks" data-subtask-for="${t.id}"${subOpen}>
+      <summary title="展开 / 收起子任务">子任务 <span class="subtask-count">${subDone}/${subs.length}</span></summary>
+      ${subs.length ? `<ul class="subtask-list">
+        ${subs.map(s => `<li class="subtask-item ${s.done ? 'subtask-done' : ''}">
+          <input type="checkbox" data-subtask-toggle="${s.id}" data-task="${t.id}" aria-label="完成子任务：${esc(s.text)}" ${s.done ? 'checked' : ''}>
+          <span class="subtask-text">${esc(s.text)}</span>
+          <button type="button" class="subtask-del" data-act="del-subtask" data-id="${t.id}" data-sub="${s.id}" aria-label="删除子任务">×</button>
+        </li>`).join('')}
+      </ul>` : ''}
+      <div class="subtask-add">
+        <input type="text" maxlength="60" data-subtask-input="${t.id}" placeholder="添加子任务…" aria-label="添加子任务">
+        <button type="button" data-act="add-subtask" data-id="${t.id}">添加</button>
+      </div>
+    </details>
   </li>`;
 }
 
@@ -1136,12 +1359,14 @@ function compactTaskRow(t) {
   const prio = Number(t.priority) || 2;
   const prioCls = prio === 1 ? 'prio-high' : prio === 3 ? 'prio-low' : 'prio-mid';
   const timeText = t.start && t.end ? `${t.start}–${t.end}` : '';
+  const recurring = !!recurringDefForTask(t);
   return `<li class="compact ${prioCls} ${t.done ? 'done' : ''} ${running ? 'running' : ''} ${focusing ? 'focusing' : ''}">
     <input type="checkbox" data-act="done" data-id="${t.id}" ${t.done ? 'checked' : ''}>
     <div class="t-main">
       <div class="t-name">
         <span class="tag cat-${esc(t.cat || 'other')}">${cat}</span>
         <span class="t-title" title="${esc(t.name)}">${esc(t.name)}</span>
+        ${recurring ? '<span class="repeat-mark" title="每天重复">🔁</span>' : ''}
       </div>
     </div>
     ${timeText ? `<span class="t-time">${timeText}</span>` : ''}
@@ -1433,6 +1658,116 @@ function updateHeatmapToday() {
   refreshHeatSummary();
 }
 
+/* ===== 渲染：数据统计（学习周报） ===== */
+function reportMinutes(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  return s > 0 ? Math.max(1, Math.round(s / 60)) : 0;
+}
+
+function weekHoursText(sec) {
+  const h = Math.max(0, Number(sec) || 0) / 3600;
+  if (h <= 0) return '0';
+  if (h < 0.05) return '<0.1';
+  return h.toFixed(1).replace(/\.0$/, '');
+}
+
+function weekDateLabel(date) {
+  return `${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))}`;
+}
+
+function weekReportStats() {
+  const today = todayStr();
+  const start = weekStartStr(today);
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(start, i);
+    days.push({ date, weekday: WEEKDAYS[i], seconds: 0 });
+  }
+  const byDate = new Map(days.map(d => [d.date, d]));
+  const catSeconds = {};
+  let totalSeconds = 0;
+
+  for (const t of state.tasks) {
+    // state.tasks 本地字段是 date；兼容旧数据 / 云端行的 task_date
+    const date = dateOnly(t.date || t.task_date);
+    const day = byDate.get(date);
+    if (!day) continue;
+    const sec = Math.max(0, elapsed(t)); // 以 actualSeconds 为基准，计时中补上当前这一段
+    day.seconds += sec;
+    totalSeconds += sec;
+    if (sec > 0) {
+      const cat = t.cat || 'other';
+      catSeconds[cat] = (catSeconds[cat] || 0) + sec;
+    }
+  }
+
+  const topCats = Object.keys(catSeconds)
+    .sort((a, b) => catSeconds[b] - catSeconds[a])
+    .slice(0, 3)
+    .map(cat => ({ cat, seconds: catSeconds[cat], minutes: reportMinutes(catSeconds[cat]) }));
+
+  return {
+    today, start, end: addDays(start, 6), days, totalSeconds,
+    totalMinutes: reportMinutes(totalSeconds),
+    activeDays: days.filter(d => d.seconds > 0).length,
+    topCats
+  };
+}
+
+function renderStats() {
+  const hoursEl = $('stats-week-hours');
+  const subEl = $('stats-week-sub');
+  const chartEl = $('stats-chart');
+  const rankEl = $('stats-rank');
+  if (!chartEl || !rankEl) return;
+
+  const report = weekReportStats();
+  if (hoursEl) hoursEl.textContent = weekHoursText(report.totalSeconds);
+  if (subEl) {
+    subEl.textContent = `${weekDateLabel(report.start)} – ${weekDateLabel(report.end)} · 共 ${report.totalMinutes} 分钟 · ${report.activeDays} 天有专注`;
+  }
+
+  const maxSec = Math.max(...report.days.map(d => d.seconds), 0);
+  chartEl.innerHTML = report.days.map((d, i) => {
+    const isToday = d.date === report.today;
+    const isFuture = d.date > report.today;
+    const isZero = d.seconds <= 0;
+    const pct = !isZero && maxSec > 0 ? Math.max(4, (d.seconds / maxSec) * 86) : 0;
+    const minutes = reportMinutes(d.seconds);
+    const tip = `${WEEKDAYS[i]} ${weekDateLabel(d.date)}，专注 ${minutes} 分钟`;
+    const cls = ['weekly-col'];
+    if (isToday) cls.push('today');
+    if (isFuture) cls.push('future');
+    return `<div class="${cls.join(' ')}" style="--bar:${pct.toFixed(1)}%" title="${tip}" aria-label="${tip}">
+      <div class="weekly-plot">
+        <span class="weekly-val">${minutes}</span>
+        <div class="weekly-bar${isZero ? ' is-zero' : ''}"></div>
+      </div>
+      <div class="weekly-axis"><b>${WEEKDAYS[i]}</b><span>${weekDateLabel(d.date)}</span></div>
+    </div>`;
+  }).join('');
+  chartEl.setAttribute('aria-label',
+    '本周每日专注分钟数：' + report.days.map((d, i) => `${WEEKDAYS[i]} ${reportMinutes(d.seconds)} 分钟`).join('，'));
+
+  const maxCatSec = report.topCats.length ? report.topCats[0].seconds : 0;
+  rankEl.innerHTML = report.topCats.length
+    ? report.topCats.map((c, i) => {
+      const name = CATS[c.cat] || '其他';
+      const pct = maxCatSec > 0 ? Math.max(6, (c.seconds / maxCatSec) * 100) : 0;
+      return `<li class="weekly-rank-item">
+        <span class="weekly-rank-no">${i + 1}</span>
+        <div class="weekly-rank-main">
+          <div class="weekly-rank-top">
+            <span class="weekly-rank-name"><span class="tag cat-${esc(c.cat)}">${esc(name)}</span></span>
+            <span class="weekly-rank-min">${c.minutes} 分钟</span>
+          </div>
+          <div class="weekly-rank-track"><span class="weekly-rank-fill" style="--p:${pct.toFixed(1)}%"></span></div>
+        </div>
+      </li>`;
+    }).join('')
+    : '<li class="weekly-rank-empty">本周还没有专注记录，去完成任务试试 🌱</li>';
+}
+
 /* ===== 渲染：全部 ===== */
 function renderAll() {
   renderDash();
@@ -1441,6 +1776,7 @@ function renderAll() {
   renderFitness();
   renderCountdown();
   renderHeatmap();
+  renderStats();
   renderFocus();
 }
 
@@ -1466,6 +1802,10 @@ function liveUpdate() {
     const d = parseDate(now);
     fitView = { y: d.getFullYear(), m: d.getMonth() };
     renderFitness();
+    if (ensureRecurringInstances() > 0) {
+      save();
+      renderAll();
+    }
   }
 
   // 专注倒计时
@@ -1480,9 +1820,8 @@ function liveUpdate() {
       const timeEl = $('fp-time');
       if (timeEl) timeEl.textContent = focusText(remain);
       if (remain <= 0) {
-        playFocusChime();
         syncToast(`🍅 番茄钟完成：${t.name}，休息一下吧`);
-        endTaskTimer(t); // 倒计时结束自动结算
+        endTaskTimer(t); // 内部播放提示音并弹系统通知，再自动结算
       }
     }
   }
@@ -1612,42 +1951,176 @@ function renderActiveTab() {
     renderFitness();
   } else if (state.ui.tab === 'mood') {
     loadMoods();
+  } else if (state.ui.tab === 'stats') {
+    renderStats();
   }
 }
 
 // 手动改 hash / 浏览器前进后退时也同步刷新
 window.addEventListener('hashchange', () => {
   const tab = (location.hash || '').replace('#', '');
-  if (!['dash', 'courses', 'tasks', 'fitness', 'mood'].includes(tab) || tab === state.ui.tab) return;
+  if (!['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats'].includes(tab) || tab === state.ui.tab) return;
   state.ui.tab = tab;
   save();
   switchTab();
   renderActiveTab();
 });
 
+/* ===== 添加表单：默认收起，点击展开 ===== */
+function setFormPanel(panelId, toggleId, open) {
+  const panel = $(panelId);
+  const toggle = $(toggleId);
+  if (!panel || !toggle) return;
+  open = !!open;
+  panel.classList.toggle('is-open', open);
+  panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+  if (open) panel.removeAttribute('inert');
+  else panel.setAttribute('inert', '');
+  toggle.classList.toggle('is-open', open);
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  const icon = toggle.querySelector('.form-toggle-icon');
+  const text = toggle.querySelector('.form-toggle-text');
+  const hint = toggle.querySelector('.form-toggle-hint');
+  if (icon) icon.textContent = open ? '－' : '＋';
+  if (text) text.textContent = open
+    ? (toggle.dataset.openText || '收起')
+    : (toggle.dataset.closedText || '展开');
+  if (hint) hint.textContent = open ? '点击收起' : '点击展开';
+}
+
+function bindFormPanel(panelId, toggleId) {
+  const panel = $(panelId);
+  const toggle = $(toggleId);
+  if (!panel || !toggle) return;
+  toggle.addEventListener('click', () => {
+    const open = !panel.classList.contains('is-open');
+    setFormPanel(panelId, toggleId, open);
+    if (!open) return;
+    const first = panel.querySelector('input:not([type="hidden"]):not([type="checkbox"]), select, textarea');
+    if (!first) return;
+    setTimeout(() => {
+      if (panel.classList.contains('is-open')) first.focus();
+    }, 220);
+  });
+  setFormPanel(panelId, toggleId, false);
+}
+
+function closeTaskForm() {
+  const panel = $('task-form-panel');
+  const active = document.activeElement;
+  const shouldFocus = !!(panel && active && panel.contains(active));
+  setFormPanel('task-form-panel', 'task-form-toggle', false);
+  const toggle = $('task-form-toggle');
+  if (shouldFocus && toggle) toggle.focus();
+}
+
+function closeCourseForm() {
+  const panel = $('course-form-panel');
+  const active = document.activeElement;
+  const shouldFocus = !!(panel && active && panel.contains(active));
+  setFormPanel('course-form-panel', 'course-form-toggle', false);
+  const toggle = $('course-form-toggle');
+  if (shouldFocus && toggle) toggle.focus();
+}
+
+function resetTaskForm() {
+  const form = $('task-form');
+  if (!form) return;
+  form.reset();
+  form.elements.date.value = state.ui.taskDate || todayStr();
+  form.elements.est.value = 60;
+  form.elements.priority.value = '2';
+}
+
+function setCourseListPanel(open) {
+  const panel = $('course-list-panel');
+  const toggle = $('course-list-toggle');
+  if (!panel || !toggle) return;
+  open = !!open;
+  panel.classList.toggle('is-open', open);
+  panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+  if (open) panel.removeAttribute('inert');
+  else panel.setAttribute('inert', '');
+  toggle.classList.toggle('is-open', open);
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  const hint = toggle.querySelector('.section-toggle-hint');
+  if (hint) hint.textContent = open ? '点击收起' : '点击展开';
+}
+
+function bindCourseListPanel() {
+  const panel = $('course-list-panel');
+  const toggle = $('course-list-toggle');
+  if (!panel || !toggle) return;
+  toggle.addEventListener('click', () => {
+    setCourseListPanel(!panel.classList.contains('is-open'));
+  });
+  setCourseListPanel(false);
+}
+
+bindFormPanel('task-form-panel', 'task-form-toggle');
+bindFormPanel('course-form-panel', 'course-form-toggle');
+bindCourseListPanel();
+
 /* ===== 事件：表单 ===== */
-$('task-form').addEventListener('submit', e => {
+$('task-form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, el = f.elements;
   const name = String(el.name.value || '').trim();
   if (!name) { alert('请填写任务名'); return; }
   const start = el.start.value || '', end = el.end.value || '';
   if (start && end && toMin(end) <= toMin(start)) { alert('计划结束时间要晚于开始时间'); return; }
+
+  const today = todayStr();
+  const picked = dateOnly(el.date.value || today);
+  const date = taskDatePicked && /^\d{4}-\d{2}-\d{2}$/.test(picked) ? picked : today;
+  const repeat = !!(el.repeat && el.repeat.checked);
+  const cat = el.cat.value || 'other';
+  const priority = Number(el.priority.value) || 2;
+  const est = Number(el.est.value) || 60;
+  if (repeat && !cloud.user) await ensureCloudUser(); // 尽量把重复任务记到当前账号名下
+  if (repeat) claimLocalRecurringDefs(recurringOwner());
+
+  const repeatDef = repeat ? {
+    id: 'rec_' + uid(),
+    owner: recurringOwner(),
+    name,
+    cat,
+    start,
+    end,
+    priority,
+    est,
+    startDate: date,
+    skipped: []
+  } : null;
+  if (repeatDef) recurringDefs().push(repeatDef);
+
   const payload = {
-    id: uid(), name,
-    cat: el.cat.value || 'other',
-    date: el.date.value || todayStr(),
+    id: repeatDef ? recurringInstanceId(repeatDef.id, date) : uid(),
+    recurId: repeatDef ? repeatDef.id : '',
+    name,
+    cat,
+    date,
     start, end,
-    priority: Number(el.priority.value) || 2,
-    est: Number(el.est.value) || 60,
+    priority,
+    est,
     dateManual: taskDatePicked,
     done: false, actualSeconds: 0, run: 0
   };
-  addTask(payload);
-  f.reset();
-  el.date.value = state.ui.taskDate || todayStr();
-  el.est.value = 60;
-  el.priority.value = '2';
+  addTask(payload).then(saved => {
+    if (saved) {
+      closeTaskForm();
+      resetTaskForm();
+    }
+    if (!saved && repeatDef) {
+      const defs = recurringDefs();
+      const i = defs.findIndex(d => d && d.id === repeatDef.id);
+      if (i >= 0) defs.splice(i, 1);
+      saveLocal();
+    } else if (saved && repeatDef && ensureRecurringInstances() > 0) {
+      save(); // 起始日期填了过去的日期时，补建今天的实例并同步
+      renderAll();
+    }
+  });
 });
 
 // 用户手动改过添加日期后，才允许任务落到非今天
@@ -1676,6 +2149,7 @@ $('course-form').addEventListener('submit', e => {
   el.start.value = '08:00';
   el.end.value = '09:40';
   renderAll();
+  closeCourseForm();
 });
 
 $('task-date').addEventListener('change', e => {
@@ -1798,6 +2272,17 @@ document.addEventListener('click', e => {
   if (act === 'adopt-one') { adoptOne(id); return; }
   if (act === 'dismiss') { $('suggest-box').classList.add('hidden'); pendingSuggest = null; return; }
 
+  if (act === 'add-subtask') {
+    const row = btn.closest('li');
+    const input = row && row.querySelector('[data-subtask-input]');
+    addSubtask(id, input && input.value);
+    return;
+  }
+  if (act === 'del-subtask') {
+    deleteSubtask(id, btn.dataset.sub);
+    return;
+  }
+
   if (act === 'del-course') {
     const c = state.courses.find(x => x.id === id);
     if (c && confirm(`删除课程「${c.name}」？`)) {
@@ -1809,6 +2294,18 @@ document.addEventListener('click', e => {
 
   const t = state.tasks.find(x => x.id === id);
   if (!t) return;
+
+  if (act === 'stop-repeat') {
+    if (!recurringDefForTask(t)) { syncToast('没有找到这个任务的重复设置'); return; }
+    if (confirm(`停止「${t.name}」的每天重复？\n当前任务会保留。`)) {
+      if (stopRecurring(t)) {
+        saveLocal();
+        renderAll();
+        syncToast('已停止每天重复');
+      }
+    }
+    return;
+  }
 
   if (act === 'start') startTaskTimer(t);
   else if (act === 'pause') pauseTaskTimer(t);
@@ -1828,6 +2325,31 @@ document.addEventListener('change', e => {
   if (t.done && t.run) pauseTimer(t);
   save(); renderAll();
 });
+
+/* ===== 事件：子任务 ===== */
+document.addEventListener('change', e => {
+  const el = e.target;
+  if (!el.dataset || !el.dataset.subtaskToggle || !el.dataset.task) return;
+  toggleSubtask(el.dataset.task, el.dataset.subtaskToggle, el.checked);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || e.isComposing) return;
+  const input = e.target && e.target.closest ? e.target.closest('[data-subtask-input]') : null;
+  if (!input) return;
+  e.preventDefault();
+  addSubtask(input.dataset.subtaskInput, input.value);
+});
+
+// details 的 toggle 事件不冒泡，用捕获阶段记住展开状态，重渲染后不自动收起
+document.addEventListener('toggle', e => {
+  const box = e.target;
+  if (!box || !box.matches || !box.matches('details.subtasks')) return;
+  const taskId = box.dataset.subtaskFor;
+  if (!taskId) return;
+  if (box.open) openSubtasks.add(taskId);
+  else openSubtasks.delete(taskId);
+}, true);
 
 /* ===== 课表点击删除 ===== */
 $('week-grid').addEventListener('click', e => {
@@ -1893,7 +2415,7 @@ $('week-grid').addEventListener('click', e => {
 
 /* ===== 启动 ===== */
 (function init() {
-  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood'];
+  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats'];
   const hashTab = (location.hash || '').replace('#', '');
   if (TABS.includes(hashTab)) state.ui.tab = hashTab;
   if (!TABS.includes(state.ui.tab)) state.ui.tab = 'dash'; // 旧存档可能停在已删除的倒计时页
@@ -1903,6 +2425,7 @@ $('week-grid').addEventListener('click', e => {
   // 专注会话指向的任务被删除/已完成时清理
   if (state.focus && !state.tasks.some(t => t.id === state.focus.taskId && !t.done)) state.focus = null;
   fitToday = todayStr();
+  if (ensureRecurringInstances() > 0) saveLocal(); // 打开网页时补齐当天的重复任务
   switchTab();
   renderAll();
   initMoods();

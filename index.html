@@ -8,7 +8,8 @@
 <meta http-equiv="Expires" content="0">
 <title>学习管理 · 考公 / 四级 / 课表</title>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<link rel="stylesheet" href="style.css?v=20261106n">
+<link rel="stylesheet" href="style.css?v=20261106t">
+<script src="theme.js?v=20261106a"></script>
 </head>
 <body>
 <header class="topbar">
@@ -24,8 +25,12 @@
     <button data-tab="tasks">任务</button>
     <button data-tab="fitness">健身</button>
     <button data-tab="mood">碎碎念</button>
+    <button data-tab="stats">数据统计</button>
   </nav>
   <div class="auth-area">
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换到深色模式" aria-pressed="false" title="切换到深色模式">
+      <span id="theme-icon" class="theme-icon" aria-hidden="true">🌙</span>
+    </button>
     <button id="auth-btn" class="auth-btn" type="button">登录 / 注册</button>
     <div id="avatar-wrap" class="avatar-wrap hidden">
       <button id="avatar-btn" class="avatar-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="账户与头像菜单">
@@ -181,24 +186,34 @@
     </div>
 
     <div class="big-card">
-      <div class="block first">
-        <h2>添加课程</h2>
-        <form id="course-form" class="form-grid">
-          <label>课程名<input name="name" maxlength="30" placeholder="如：数据结构" required></label>
-          <label>星期
-            <select name="weekday">
-              <option value="1">周一</option><option value="2">周二</option>
-              <option value="3">周三</option><option value="4">周四</option>
-              <option value="5">周五</option><option value="6">周六</option>
-              <option value="7">周日</option>
-            </select>
-          </label>
-          <label>开始<input type="time" name="start" value="08:00" required></label>
-          <label>结束<input type="time" name="end" value="09:40" required></label>
-          <label>地点<input name="place" maxlength="20" placeholder="如：教三 302"></label>
-          <button class="btn" type="submit">添加课程</button>
-        </form>
-        <p id="course-warn" class="warn hidden"></p>
+      <div class="block first form-collapse-block">
+        <button id="course-form-toggle" class="form-toggle" type="button"
+          aria-expanded="false" aria-controls="course-form-panel"
+          data-open-text="收起添加课程" data-closed-text="添加新课程">
+          <span class="form-toggle-icon" aria-hidden="true">＋</span>
+          <span class="form-toggle-text">添加新课程</span>
+          <span class="form-toggle-hint">点击展开</span>
+        </button>
+        <div id="course-form-panel" class="form-panel" aria-hidden="true" inert>
+          <div class="form-panel-inner">
+            <form id="course-form" class="form-grid">
+              <label>课程名<input name="name" maxlength="30" placeholder="如：数据结构" required></label>
+              <label>星期
+                <select name="weekday">
+                  <option value="1">周一</option><option value="2">周二</option>
+                  <option value="3">周三</option><option value="4">周四</option>
+                  <option value="5">周五</option><option value="6">周六</option>
+                  <option value="7">周日</option>
+                </select>
+              </label>
+              <label>开始<input type="time" name="start" value="08:00" required></label>
+              <label>结束<input type="time" name="end" value="09:40" required></label>
+              <label>地点<input name="place" maxlength="20" placeholder="如：教三 302"></label>
+              <button class="btn" type="submit">添加课程</button>
+            </form>
+            <p id="course-warn" class="warn hidden"></p>
+          </div>
+        </div>
       </div>
 
       <div class="block">
@@ -209,9 +224,19 @@
         <div class="week-wrap"><div id="week-grid" class="week-grid"></div></div>
       </div>
 
-      <div class="block">
-        <h2>课程列表</h2>
-        <ul id="course-list" class="courselist"></ul>
+      <div class="block course-list-block">
+        <button id="course-list-toggle" class="section-toggle" type="button"
+          aria-expanded="false" aria-controls="course-list-panel">
+          <span class="section-toggle-emoji" aria-hidden="true">📝</span>
+          <span class="section-toggle-text">管理课程列表</span>
+          <span class="section-toggle-hint">点击展开</span>
+          <span class="section-toggle-arrow" aria-hidden="true">▶</span>
+        </button>
+        <div id="course-list-panel" class="section-panel" aria-hidden="true" inert>
+          <div class="section-panel-inner">
+            <ul id="course-list" class="courselist"></ul>
+          </div>
+        </div>
       </div>
 
       <div class="block">
@@ -229,31 +254,45 @@
     </div>
 
     <div class="big-card">
-      <div class="block first">
-        <h2>添加任务</h2>
-        <form id="task-form" class="form-grid">
-          <label>任务名<input name="name" maxlength="40" placeholder="如：行测资料分析 30 题" required></label>
-          <label>类别
-            <select name="cat">
-              <option value="gongkao">考公</option>
-              <option value="cet4">四级</option>
-              <option value="other">其他</option>
-              <option value="fitness">健身</option>
-            </select>
-          </label>
-          <label>日期<input type="date" name="date"></label>
-          <label>计划开始<input type="time" name="start"></label>
-          <label>计划结束<input type="time" name="end"></label>
-          <label>优先级
-            <select name="priority">
-              <option value="1">高</option>
-              <option value="2" selected>中</option>
-              <option value="3">低</option>
-            </select>
-          </label>
-          <label>预计分钟<input type="number" name="est" min="5" max="480" step="5" value="60"></label>
-          <button class="btn" type="submit">添加任务</button>
-        </form>
+      <div class="block first form-collapse-block">
+        <button id="task-form-toggle" class="form-toggle" type="button"
+          aria-expanded="false" aria-controls="task-form-panel"
+          data-open-text="收起添加任务" data-closed-text="添加新任务">
+          <span class="form-toggle-icon" aria-hidden="true">＋</span>
+          <span class="form-toggle-text">添加新任务</span>
+          <span class="form-toggle-hint">点击展开</span>
+        </button>
+        <div id="task-form-panel" class="form-panel" aria-hidden="true" inert>
+          <div class="form-panel-inner">
+            <form id="task-form" class="form-grid">
+              <label>任务名<input name="name" maxlength="40" placeholder="如：行测资料分析 30 题" required></label>
+              <label>类别
+                <select name="cat">
+                  <option value="gongkao">考公</option>
+                  <option value="cet4">四级</option>
+                  <option value="other">其他</option>
+                  <option value="fitness">健身</option>
+                </select>
+              </label>
+              <label>日期<input type="date" name="date"></label>
+              <label>计划开始<input type="time" name="start"></label>
+              <label>计划结束<input type="time" name="end"></label>
+              <label>优先级
+                <select name="priority">
+                  <option value="1">高</option>
+                  <option value="2" selected>中</option>
+                  <option value="3">低</option>
+                </select>
+              </label>
+              <label>预计分钟<input type="number" name="est" min="5" max="480" step="5" value="60"></label>
+              <label class="repeat-check" title="勾选后每天自动生成当天的任务">
+                <input type="checkbox" name="repeat" id="task-repeat">
+                <span>🔁 每天自动重复</span>
+              </label>
+              <button class="btn" type="submit">添加任务</button>
+            </form>
+          </div>
+        </div>
       </div>
 
       <div class="block">
@@ -360,6 +399,33 @@
       </div>
     </div>
   </section>
+
+  <!-- 数据统计（学习周报） -->
+  <section id="page-stats" class="page">
+    <div class="hero weekly-hero">
+      <p class="weekly-kicker">WEEKLY REPORT</p>
+      <h1 class="weekly-total">本周学习时长：<strong id="stats-week-hours">0</strong> 小时</h1>
+      <p class="hero-sub" id="stats-week-sub">周一至周日 · 来自任务实际用时</p>
+    </div>
+
+    <div class="big-card weekly-card">
+      <div class="block first">
+        <div class="block-head">
+          <h2>本周每日专注</h2>
+          <span class="muted">单位：分钟</span>
+        </div>
+        <div id="stats-chart" class="weekly-chart" role="img" aria-label="本周每日专注分钟数柱状图"></div>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2>学习时长 Top 3 类别</h2>
+          <span class="muted">按本周累计</span>
+        </div>
+        <ol id="stats-rank" class="weekly-rank-list"></ol>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- 白噪音悬浮播放器 -->
@@ -434,7 +500,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20261106o"></script>
+<script src="app.js?v=20261106u"></script>
 <script>
 /* 仪表盘专注目标进度：只读取 localStorage，目标值也只存在本机 */
 (function () {
