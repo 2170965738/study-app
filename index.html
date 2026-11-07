@@ -8,7 +8,7 @@
 <meta http-equiv="Expires" content="0">
 <title>学习管理 · 考公 / 四级 / 课表</title>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<link rel="stylesheet" href="style.css?v=20261106t">
+<link rel="stylesheet" href="style.css?v=20261108b">
 <script src="theme.js?v=20261106a"></script>
 </head>
 <body>
@@ -26,6 +26,7 @@
     <button data-tab="fitness">健身</button>
     <button data-tab="mood">碎碎念</button>
     <button data-tab="stats">数据统计</button>
+    <button data-tab="plans">长期计划</button>
   </nav>
   <div class="auth-area">
     <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换到深色模式" aria-pressed="false" title="切换到深色模式">
@@ -85,7 +86,10 @@
   <section id="page-dash" class="page active">
     <!-- 首屏题记 -->
     <div class="hero-section">
-      <p class="hero-quote" id="hero-quote">星光不问赶路人，时光不负有心人。</p>
+      <p class="hero-quote" id="hero-quote">
+        <span class="hero-quote-text">The only way to do great work is to love what you do.</span>
+        <span class="hero-quote-author">—— Steve Jobs</span>
+      </p>
       <!-- app.js 仍会更新这两个日期节点，保留隐藏占位，避免改动业务逻辑 -->
       <span id="d-date" class="hero-date-holder"></span>
       <span id="d-week" class="hero-date-holder"></span>
@@ -378,6 +382,24 @@
     </div>
 
     <div class="journal-wrap">
+      <div class="big-card mood-tree-card">
+        <div class="mood-tree-head">
+          <h2>🌱 你的情绪之树 <span class="mood-tree-sep" aria-hidden="true">·</span> <span class="mood-tree-sub">记录你的高频碎碎念</span></h2>
+        </div>
+        <div class="mood-tree-stage">
+          <svg class="mood-tree-svg" viewBox="0 0 320 240" aria-hidden="true" preserveAspectRatio="xMidYMid meet">
+            <ellipse class="mood-tree-crown" cx="160" cy="106" rx="132" ry="98"></ellipse>
+            <ellipse class="mood-tree-ground" cx="160" cy="224" rx="84" ry="6"></ellipse>
+            <path class="mood-tree-trunk" d="M160 222 C156 190 156 158 160 126"></path>
+            <path class="mood-tree-branch" d="M160 174 C142 158 126 146 108 134"></path>
+            <path class="mood-tree-branch" d="M160 158 C178 142 196 132 214 122"></path>
+            <path class="mood-tree-branch" d="M160 196 C145 184 132 176 118 168"></path>
+            <path class="mood-tree-branch" d="M160 198 C176 186 190 178 204 170"></path>
+          </svg>
+          <div id="mood-tree-cloud" class="mood-tree-cloud" role="group" aria-label="情绪树高频词"></div>
+        </div>
+      </div>
+
       <div class="big-card journal-editor">
         <p class="mood-sub" id="mood-sub">今天的情绪，也值得被轻轻记下来。</p>
         <form id="mood-form" class="mood-form">
@@ -412,7 +434,7 @@
       <div class="block first">
         <div class="block-head">
           <h2>本周每日专注</h2>
-          <span class="muted">单位：分钟</span>
+          <span class="muted">单位：分钟 / 小时</span>
         </div>
         <div id="stats-chart" class="weekly-chart" role="img" aria-label="本周每日专注分钟数柱状图"></div>
       </div>
@@ -423,6 +445,46 @@
           <span class="muted">按本周累计</span>
         </div>
         <ol id="stats-rank" class="weekly-rank-list"></ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- 长期计划（里程碑 / 冲刺阶段） -->
+  <section id="page-plans" class="page">
+    <div class="hero">
+      <h1>长期计划</h1>
+      <p class="hero-sub">把漫长的备考，拆成一个个能看见的阶段</p>
+    </div>
+
+    <div class="big-card plans-card">
+      <div class="block first form-collapse-block">
+        <button id="plan-form-toggle" class="form-toggle" type="button"
+          aria-expanded="false" aria-controls="plan-form-panel"
+          data-open-text="收起添加阶段" data-closed-text="添加新阶段">
+          <span class="form-toggle-icon" aria-hidden="true">＋</span>
+          <span class="form-toggle-text">添加新阶段</span>
+          <span class="form-toggle-hint">点击展开</span>
+        </button>
+        <div id="plan-form-panel" class="form-panel" aria-hidden="true" inert>
+          <div class="form-panel-inner">
+            <form id="plan-form" class="form-grid plan-form">
+              <label>阶段名称<input name="title" maxlength="40" placeholder="如：高频词扫盲" required></label>
+              <label>开始日期<input type="date" name="start" required></label>
+              <label>结束日期<input type="date" name="end" required></label>
+              <label class="plan-detail-label">核心任务<textarea name="detail" maxlength="300" rows="3" placeholder="这一阶段主要完成什么？"></textarea></label>
+              <button class="btn" type="submit">添加阶段</button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h2>阶段时间线</h2>
+          <span class="muted" id="plans-hint">按开始日期排列</span>
+        </div>
+        <p id="plans-msg" class="plan-msg" role="status"></p>
+        <div id="plans-timeline" class="plans-timeline"></div>
       </div>
     </div>
   </section>
@@ -500,7 +562,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20261106u"></script>
+<script src="app.js?v=20261108d"></script>
 <script>
 /* 仪表盘专注目标进度：只读取 localStorage，目标值也只存在本机 */
 (function () {
@@ -586,18 +648,37 @@
 })();
 </script>
 <script>
-/* 首屏欢迎语：每次刷新随机一条，只做展示 */
+/* 英文每日一言：每次刷新随机一条，只做展示 */
 (function () {
   const QUOTES = [
-    '星光不问赶路人，时光不负有心人。',
-    '慢慢来，比较快。',
-    '今天也有一点小小的进步，就很好了。',
-    '我们记录，不是为了证明什么，只是想在很久以后，还能认出当时的自己。',
-    '不要慌，太阳下山有月光。'
+    "The only way to do great work is to love what you do. —— Steve Jobs",
+    "Success is not final, failure is not fatal: it is the courage to continue that counts. —— Winston Churchill",
+    "It always seems impossible until it's done. —— Nelson Mandela",
+    "The future belongs to those who believe in the beauty of their dreams. —— Eleanor Roosevelt",
+    "Believe you can and you're halfway there. —— Theodore Roosevelt",
+    "Genius is one percent inspiration and ninety-nine percent perspiration. —— Thomas Edison",
+    "Do what you can, with what you have, where you are. —— Theodore Roosevelt"
   ];
   const el = document.getElementById('hero-quote');
   if (!el) return;
-  el.textContent = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+
+  const raw = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+  const parts = raw.split('——');
+  const text = (parts.shift() || '').trim();
+  const author = parts.join('——').trim();
+
+  el.textContent = '';
+  const textEl = document.createElement('span');
+  textEl.className = 'hero-quote-text';
+  textEl.textContent = text;
+  el.appendChild(textEl);
+
+  if (author) {
+    const authorEl = document.createElement('span');
+    authorEl.className = 'hero-quote-author';
+    authorEl.textContent = `—— ${author}`;
+    el.appendChild(authorEl);
+  }
 })();
 </script>
 <script src="auth.js?v=20261106d"></script>

@@ -819,6 +819,7 @@ function handleAuthUser(user) {
   if (!user) {
     if (cloud.client && cloud.channel) { cloud.client.removeChannel(cloud.channel); cloud.channel = null; }
     onMoodAuth(null);
+    onPlansAuth(null);
     return;
   }
   if (prevId !== user.id) {
@@ -837,6 +838,7 @@ function handleAuthUser(user) {
     });
     subscribeRealtime();
     onMoodAuth(user);
+    onPlansAuth(user);
   }
 }
 
@@ -871,6 +873,7 @@ window.studyhubSync = { push: pushCloud, pull: pullCloud, state: () => state, cl
 /* ===== 心情树洞（moods 表：全部记录） ===== */
 const MOOD_TEXT_MAX = 120;
 let moodRows = [];
+let moodLoading = false;
 let moodSeq = 0; // 增删期间丢弃迟到的旧查询结果
 
 const moodCacheKey = uid => 'studyhub.moods.' + uid;
@@ -925,9 +928,116 @@ function moodErrorText(err) {
   return '操作失败：' + msg;
 }
 
+/* ===== 情绪树：纯前端高频词提取 ===== */
+const MOOD_STOP_WORDS = new Set([
+  '今天', '但是', '我们', '自己', '觉得', '然后', '现在', '已经', '因为', '所以',
+  '如果', '可以', '这个', '那个', '什么', '时候', '还是', '一个', '没有', '就是',
+  '不是', '这么', '那么', '真的', '有点', '一些', '感觉', '心情', '碎碎念', '记录',
+  '每天', '生活', '事情', '东西', '这里', '那里', '这样', '那样', '可能', '应该',
+  '知道', '看到', '想到', '还有', '而且', '虽然', '不过', '只是', '比较', '非常',
+  '特别', '一直', '总是', '其实', '开始', '结束', '起来', '下去', '出来', '进去',
+  '我的', '你的', '他的', '她的', '它的', '地方', '一天', '今晚', '明天', '昨天',
+  '上午', '下午', '晚上', '最近', '一点', '很多', '很少', '这种', '那种', '不能',
+  '不会', '不要', '不用', '好多', '一样', '一起', '之后', '之前', '后来', '于是'
+]);
+
+function hashMoodWord(word) {
+  let h = 2166136261;
+  for (let i = 0; i < word.length; i++) {
+    h ^= word.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function extractMoodWords(text) {
+  const words = [];
+  const source = String(text || '');
+  let segmented = false;
+
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    try {
+      const segmenter = new Intl.Segmenter('zh', { granularity: 'word' });
+      for (const part of segmenter.segment(source)) {
+        if (!part.isWordLike) continue;
+        const word = String(part.segment || '').trim();
+        if (/^[\u4e00-\u9fa5]{2,}$/.test(word) && !MOOD_STOP_WORDS.has(word)) {
+          words.push(word);
+        }
+      }
+      segmented = true;
+    } catch (e) {
+      segmented = false;
+    }
+  }
+
+  if (!segmented) {
+    const runs = source.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+    for (const run of runs) {
+      for (let n = 2; n <= 3; n++) {
+        for (let i = 0; i <= run.length - n; i++) {
+          const word = run.slice(i, i + n);
+          if (!MOOD_STOP_WORDS.has(word)) words.push(word);
+        }
+      }
+    }
+  }
+
+  const counts = new Map();
+  for (const word of words) counts.set(word, (counts.get(word) || 0) + 1);
+  return Array.from(counts, ([word, count]) => ({ word, count }))
+    .sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, 'zh'))
+    .slice(0, 10);
+}
+
+function renderMoodTree() {
+  const cloud = $('mood-tree-cloud');
+  if (!cloud) return;
+
+  // 只看历史总条数，不判断“今天有没有写”
+  const total = moodRows.length;
+
+  // 正在从云端拉历史时，先显示唤醒提示，避免被误判成光秃秃的空树
+  if (moodLoading && total < 3) {
+    cloud.innerHTML = '<p class="mood-tree-empty">正在唤醒你的情绪树…</p>';
+    return;
+  }
+
+  if (total < 3) {
+    cloud.innerHTML = '<p class="mood-tree-empty">继续记录碎碎念，让这棵树长满叶子吧~</p>';
+    return;
+  }
+
+  // 历史很多时只取最近 100 条，避免一次性处理过多文本
+  const history = moodRows.slice(0, 100);
+  const source = history.map(m => String(m && m.content || '')).join('\n');
+  const words = extractMoodWords(source);
+  if (!words.length) {
+    cloud.innerHTML = '<p class="mood-tree-empty">继续记录碎碎念，让这棵树长满叶子吧~</p>';
+    return;
+  }
+
+  const max = words[0].count;
+  const min = words[words.length - 1].count;
+  const range = max - min;
+
+  cloud.innerHTML = words.map((item, i) => {
+    const seed = hashMoodWord(item.word);
+    const angle = (i * 137.5 + (seed % 29)) * Math.PI / 180;
+    const radius = 10 + i * 2.7 + (seed % 4);
+    const x = Math.min(88, Math.max(12, 50 + Math.cos(angle) * radius * 1.05));
+    const y = Math.min(70, Math.max(18, 44 + Math.sin(angle) * radius * 0.72));
+    const size = range > 0 ? Math.round(12 + ((item.count - min) / range) * 12) : 18;
+    const rot = ((seed >> 3) % 9) - 4;
+    const title = `${item.word} · 出现 ${item.count} 次`;
+    return `<span class="mood-tree-word" style="left:${x.toFixed(1)}%;top:${y.toFixed(1)}%;font-size:${size}px;--rot:${rot}deg" title="${esc(title)}">${esc(item.word)}</span>`;
+  }).join('');
+}
+
 function renderMoods() {
   const list = $('mood-list');
   if (!list) return;
+  renderMoodTree();
   const count = $('mood-count');
   if (count) count.textContent = `${moodRows.length} 条`;
   const sub = $('mood-sub');
@@ -950,17 +1060,27 @@ function renderMoods() {
 }
 
 async function loadMoods() {
+  moodLoading = true;
+  renderMoods();
+
+  if (!cloud.user) await ensureCloudUser();
   const uid = cloud.user && cloud.user.id;
   if (!uid) {
+    moodLoading = false;
     moodRows = [];
     renderMoods();
     return;
   }
+
   moodRows = moodCacheRead(uid);
   renderMoods();
 
   const client = moodClient();
-  if (!client) return;
+  if (!client) {
+    moodLoading = false;
+    renderMoods();
+    return;
+  }
   const seq = moodSeq;
   try {
     const { data, error } = await client.from('moods')
@@ -970,13 +1090,18 @@ async function loadMoods() {
     if (error) throw error;
     if (seq !== moodSeq) return; // 查询期间发生了增删，丢弃这份旧快照
     if (!cloud.user || cloud.user.id !== uid) return; // 请求期间切换了账号
+    moodLoading = false;
     moodRows = Array.isArray(data) ? data : [];
     moodCacheWrite(uid, moodRows);
     renderMoods();
     moodMsg('');
   } catch (err) {
     console.warn('[mood] load failed', err);
-    if (!moodRows.length) moodMsg(moodErrorText(err));
+    if (seq === moodSeq) {
+      moodLoading = false;
+      if (!moodRows.length) moodMsg(moodErrorText(err));
+      renderMoods();
+    }
   }
 }
 
@@ -1004,6 +1129,7 @@ async function addMood(raw) {
     if (!data) throw new Error('云端没有返回这条记录');
     if (!cloud.user || cloud.user.id !== uid) return;
 
+    moodLoading = false;
     moodRows = [data].concat(moodRows.filter(m => String(m.id) !== String(data.id)));
     moodCacheWrite(uid, moodRows);
     const input = $('mood-input');
@@ -1029,6 +1155,7 @@ async function deleteMood(id) {
   const row = moodRows[index];
   const backup = moodRows.slice();
   moodSeq++;
+  moodLoading = false;
   moodRows = moodRows.filter((_, i) => i !== index);
   renderMoods();
 
@@ -1059,6 +1186,7 @@ async function deleteMood(id) {
 // 登录状态变化时由 handleAuthUser 调用
 function onMoodAuth(user) {
   if (!user) {
+    moodLoading = false;
     moodRows = [];
     renderMoods();
     moodMsg('');
@@ -1092,10 +1220,343 @@ function initMoods() {
     if (btn) deleteMood(btn.dataset.moodDel);
   });
 
+  // 先进入“唤醒中”，避免登录状态还没就绪时树被误显示成空树
+  moodLoading = true;
   renderMoods();
+  setTimeout(() => {
+    if (moodLoading && !cloud.user && !window.studyhubUser) {
+      moodLoading = false;
+      renderMoods();
+    }
+  }, 8000);
 }
 
 window.studyhubMoods = { reload: loadMoods, add: addMood };
+
+
+/* ===== 长期计划（plans 表：CRUD 直连 Supabase） ===== */
+let planRows = [];
+let plansLoaded = false;
+let plansLoading = false;
+let plansSeq = 0;
+
+function plansClient() {
+  return cloud.client || window.studyhubClient || null;
+}
+
+function plansMsg(text, ok) {
+  const el = $('plans-msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
+}
+
+function plansErrorText(err) {
+  const msg = (err && err.message) || '未知错误';
+  if (/relation .*plans.* does not exist|Could not find the table|schema cache/i.test(msg)) {
+    return 'plans 表还没建好：先在 Supabase SQL Editor 执行 supabase-plans.sql';
+  }
+  if (/row-level security|permission denied|violates row-level/i.test(msg)) {
+    return '长期计划表权限不足：请检查 plans 表的 RLS 策略';
+  }
+  if (/Failed to fetch|NetworkError|Load failed|fetch/i.test(msg)) {
+    return '无法连接云端，请检查网络后再试';
+  }
+  return '操作失败：' + msg;
+}
+
+function sortPlans(rows) {
+  return rows.slice().sort((a, b) =>
+    String(a.start_date || '').localeCompare(String(b.start_date || '')) ||
+    String(a.created_at || '').localeCompare(String(b.created_at || '')));
+}
+
+function planDateText(plan) {
+  const start = dateOnly(plan.start_date);
+  const end = dateOnly(plan.end_date);
+  if (!start || !end) return { range: '—', sub: '' };
+  const s = parseDate(start);
+  const e = parseDate(end);
+  if (isNaN(s.getTime()) || isNaN(e.getTime())) return { range: '—', sub: '' };
+  const range = `${pad(s.getMonth() + 1)}/${pad(s.getDate())} - ${pad(e.getMonth() + 1)}/${pad(e.getDate())}`;
+  const years = s.getFullYear() === e.getFullYear()
+    ? String(s.getFullYear())
+    : `${s.getFullYear()} - ${e.getFullYear()}`;
+  const days = Math.max(1, Math.round((e - s) / 86400000) + 1);
+  return { range, sub: `${years} · ${days} 天` };
+}
+
+function planStatus(plan) {
+  const today = todayStr();
+  const start = dateOnly(plan.start_date);
+  const end = dateOnly(plan.end_date);
+  if (start && today < start) return { key: 'upcoming', text: '未开始' };
+  if (end && today > end) return { key: 'ended', text: '已结束' };
+  return { key: 'active', text: '进行中' };
+}
+
+function renderPlans() {
+  const box = $('plans-timeline');
+  if (!box) return;
+  const hint = $('plans-hint');
+  const user = cloud.user || window.studyhubUser;
+
+  if (!user) {
+    box.classList.add('is-empty');
+    box.innerHTML = plansLoaded
+      ? '<p class="plan-empty">登录后即可安排长期计划，并同步到云端。</p>'
+      : '<p class="plan-empty">正在准备…</p>';
+    if (hint) hint.textContent = plansLoaded ? '登录后同步到云端' : '按开始日期排列';
+    return;
+  }
+
+  if (plansLoading && !planRows.length) {
+    box.classList.add('is-empty');
+    box.innerHTML = '<p class="plan-empty">正在读取云端计划…</p>';
+    if (hint) hint.textContent = '同步中…';
+    return;
+  }
+
+  if (!plansLoaded && !planRows.length) {
+    box.classList.add('is-empty');
+    box.innerHTML = '<p class="plan-empty">正在准备…</p>';
+    if (hint) hint.textContent = '按开始日期排列';
+    return;
+  }
+
+  if (!planRows.length) {
+    box.classList.add('is-empty');
+    box.innerHTML = '<p class="plan-empty">还没有阶段，点上面的“添加新阶段”开始吧 🌱</p>';
+    if (hint) hint.textContent = '按开始日期排列';
+    return;
+  }
+
+  box.classList.remove('is-empty');
+  if (hint) hint.textContent = `${planRows.length} 个阶段 · 按开始日期排列`;
+  box.innerHTML = planRows.map(plan => {
+    const status = planStatus(plan);
+    const dateText = planDateText(plan);
+    const completed = !!plan.is_completed;
+    const detail = String(plan.detail || '').trim();
+    return `<div class="plan-item ${status.key}${completed ? ' is-completed' : ''}">
+      <article class="plan-card">
+        <div class="plan-date">
+          <span class="plan-date-range">${dateText.range}</span>
+          <span class="plan-date-sub">${dateText.sub}</span>
+        </div>
+        <div class="plan-main">
+          <div class="plan-head">
+            <h3 class="plan-title">${esc(plan.title || '未命名阶段')}</h3>
+            <div class="plan-tags">
+              <span class="plan-status ${status.key}">${status.text}</span>
+              ${completed ? '<span class="plan-completed">✓ 已完成</span>' : ''}
+            </div>
+          </div>
+          <p class="plan-detail${detail ? '' : ' is-empty'}">${detail ? esc(detail) : '还没有填写核心任务'}</p>
+          <div class="plan-actions">
+            <button class="plan-btn done${completed ? ' is-done' : ''}" type="button"
+              data-plan-act="toggle" data-id="${esc(plan.id)}"
+              title="${completed ? '点击取消完成' : '标记为已完成'}">${completed ? '✓ 已完成' : '标记为已完成'}</button>
+            <button class="plan-btn del" type="button" data-plan-act="del" data-id="${esc(plan.id)}">删除</button>
+          </div>
+        </div>
+      </article>
+    </div>`;
+  }).join('');
+}
+
+async function loadPlans() {
+  const seq = ++plansSeq;
+  if (!cloud.user) await ensureCloudUser();
+  if (seq !== plansSeq) return;
+  const userId = cloud.user && cloud.user.id;
+  if (!userId) {
+    planRows = [];
+    plansLoaded = true;
+    plansLoading = false;
+    plansMsg('');
+    renderPlans();
+    return;
+  }
+
+  plansLoading = true;
+  renderPlans();
+  try {
+    const client = plansClient();
+    if (!client) throw new Error('云端还没连上');
+    const { data, error } = await client.from('plans')
+      .select('*')
+      .eq('user_id', userId)
+      .order('start_date', { ascending: true })
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    if (seq !== plansSeq) return;
+    if (!cloud.user || cloud.user.id !== userId) return;
+    planRows = sortPlans(Array.isArray(data) ? data : []);
+    plansLoaded = true;
+    plansMsg('');
+  } catch (err) {
+    console.warn('[plans] load failed', err);
+    if (seq === plansSeq) {
+      plansLoaded = true;
+      plansMsg(plansErrorText(err));
+    }
+  } finally {
+    if (seq === plansSeq) {
+      plansLoading = false;
+      renderPlans();
+    }
+  }
+}
+
+function onPlansAuth(user) {
+  if (!user) {
+    planRows = [];
+    plansLoaded = true;
+    plansLoading = false;
+    plansMsg('');
+    renderPlans();
+    return;
+  }
+  plansMsg('');
+  loadPlans();
+}
+
+function resetPlanForm() {
+  const form = $('plan-form');
+  if (!form) return;
+  form.reset();
+  form.elements.start.value = todayStr();
+  form.elements.end.value = addDays(todayStr(), 14);
+}
+
+function closePlanForm() {
+  const panel = $('plan-form-panel');
+  const active = document.activeElement;
+  const shouldFocus = !!(panel && active && panel.contains(active));
+  setFormPanel('plan-form-panel', 'plan-form-toggle', false);
+  const toggle = $('plan-form-toggle');
+  if (shouldFocus && toggle) toggle.focus();
+}
+
+async function submitPlan(e) {
+  e.preventDefault();
+  const form = e.target;
+  const el = form.elements;
+  const title = String(el.title.value || '').trim();
+  const start = dateOnly(el.start.value);
+  const end = dateOnly(el.end.value);
+  const detail = String(el.detail.value || '').trim().slice(0, 300);
+  if (!title) { plansMsg('请填写阶段名称'); return; }
+  if (!start || !end) { plansMsg('请选择起止日期'); return; }
+  if (end < start) { plansMsg('结束日期不能早于开始日期'); return; }
+
+  if (!cloud.user) await ensureCloudUser();
+  const userId = cloud.user && cloud.user.id;
+  const client = plansClient();
+  if (!userId || !client) { plansMsg('登录后才能保存到云端'); return; }
+
+  const btn = form.querySelector('button[type="submit"]');
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  plansMsg('正在保存…');
+  try {
+    const row = {
+      id: uid(),
+      user_id: userId,
+      title,
+      start_date: start,
+      end_date: end,
+      detail,
+      is_completed: false
+    };
+    const { data, error } = await client.from('plans').insert(row).select().single();
+    if (error) throw error;
+    planRows = sortPlans(planRows.concat(data || row));
+    plansLoaded = true;
+    closePlanForm();
+    resetPlanForm();
+    renderPlans();
+    plansMsg('阶段已添加 🌱', true);
+  } catch (err) {
+    console.error('[plans] insert failed', err);
+    plansMsg(plansErrorText(err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '添加阶段'; }
+  }
+}
+
+async function togglePlanComplete(id) {
+  const plan = planRows.find(p => String(p.id) === String(id));
+  if (!plan) return;
+  const next = !plan.is_completed;
+  plan.is_completed = next;
+  renderPlans();
+  try {
+    if (!cloud.user) await ensureCloudUser();
+    const client = plansClient();
+    if (!client || !cloud.user) throw new Error('登录后才能同步');
+    const { error } = await client.from('plans')
+      .update({ is_completed: next })
+      .eq('id', plan.id)
+      .eq('user_id', cloud.user.id);
+    if (error) throw error;
+    plansMsg(next ? '已标记为完成 ✓' : '已取消完成', true);
+  } catch (err) {
+    console.warn('[plans] update failed', err);
+    plan.is_completed = !next;
+    renderPlans();
+    plansMsg(plansErrorText(err));
+  }
+}
+
+async function deletePlan(id) {
+  const index = planRows.findIndex(p => String(p.id) === String(id));
+  if (index < 0) return;
+  const plan = planRows[index];
+  if (!confirm(`删除阶段「${plan.title || '未命名阶段'}」？`)) return;
+  planRows.splice(index, 1);
+  renderPlans();
+  try {
+    if (!cloud.user) await ensureCloudUser();
+    const client = plansClient();
+    if (!client || !cloud.user) throw new Error('登录后才能同步');
+    const { error } = await client.from('plans')
+      .delete()
+      .eq('id', plan.id)
+      .eq('user_id', cloud.user.id);
+    if (error) throw error;
+    plansMsg('阶段已删除', true);
+  } catch (err) {
+    console.warn('[plans] delete failed', err);
+    planRows.splice(index, 0, plan);
+    planRows = sortPlans(planRows);
+    renderPlans();
+    plansMsg(plansErrorText(err));
+  }
+}
+
+function initPlans() {
+  const form = $('plan-form');
+  const timeline = $('plans-timeline');
+  if (form && !form.dataset.bound) {
+    form.dataset.bound = '1';
+    form.addEventListener('submit', submitPlan);
+    form.elements.start.value = todayStr();
+    form.elements.end.value = addDays(todayStr(), 14);
+  }
+  if (timeline && !timeline.dataset.bound) {
+    timeline.dataset.bound = '1';
+    timeline.addEventListener('click', e => {
+      const btn = e.target.closest('[data-plan-act]');
+      if (!btn) return;
+      if (btn.dataset.planAct === 'toggle') togglePlanComplete(btn.dataset.id);
+      else if (btn.dataset.planAct === 'del') deletePlan(btn.dataset.id);
+    });
+  }
+  renderPlans();
+}
+
+window.studyhubPlans = { reload: loadPlans, state: () => planRows };
 
 
 /* ===== 空闲时段 ===== */
@@ -1664,6 +2125,13 @@ function reportMinutes(sec) {
   return s > 0 ? Math.max(1, Math.round(s / 60)) : 0;
 }
 
+// 统一时长展示：> 60 分钟用一位小数小时，否则保持分钟
+function formatStudyDuration(minutes) {
+  const m = Math.max(0, Math.round(Number(minutes) || 0));
+  if (m > 60) return `${(m / 60).toFixed(1)} 小时`;
+  return `${m} 分钟`;
+}
+
 function weekHoursText(sec) {
   const h = Math.max(0, Number(sec) || 0) / 3600;
   if (h <= 0) return '0';
@@ -1734,20 +2202,24 @@ function renderStats() {
     const isZero = d.seconds <= 0;
     const pct = !isZero && maxSec > 0 ? Math.max(4, (d.seconds / maxSec) * 86) : 0;
     const minutes = reportMinutes(d.seconds);
-    const tip = `${WEEKDAYS[i]} ${weekDateLabel(d.date)}，专注 ${minutes} 分钟`;
+    const full = formatStudyDuration(minutes);
+    const tip = `${WEEKDAYS[i]} ${weekDateLabel(d.date)}，专注 ${full}`;
     const cls = ['weekly-col'];
     if (isToday) cls.push('today');
     if (isFuture) cls.push('future');
     return `<div class="${cls.join(' ')}" style="--bar:${pct.toFixed(1)}%" title="${tip}" aria-label="${tip}">
       <div class="weekly-plot">
-        <span class="weekly-val">${minutes}</span>
+        <span class="weekly-val" title="${tip}">
+          <span class="weekly-val-full">${full}</span>
+          <span class="weekly-val-short">${minutes}</span>
+        </span>
         <div class="weekly-bar${isZero ? ' is-zero' : ''}"></div>
       </div>
       <div class="weekly-axis"><b>${WEEKDAYS[i]}</b><span>${weekDateLabel(d.date)}</span></div>
     </div>`;
   }).join('');
   chartEl.setAttribute('aria-label',
-    '本周每日专注分钟数：' + report.days.map((d, i) => `${WEEKDAYS[i]} ${reportMinutes(d.seconds)} 分钟`).join('，'));
+    '本周每日专注时长：' + report.days.map((d, i) => `${WEEKDAYS[i]} ${formatStudyDuration(reportMinutes(d.seconds))}`).join('，'));
 
   const maxCatSec = report.topCats.length ? report.topCats[0].seconds : 0;
   rankEl.innerHTML = report.topCats.length
@@ -1759,7 +2231,7 @@ function renderStats() {
         <div class="weekly-rank-main">
           <div class="weekly-rank-top">
             <span class="weekly-rank-name"><span class="tag cat-${esc(c.cat)}">${esc(name)}</span></span>
-            <span class="weekly-rank-min">${c.minutes} 分钟</span>
+            <span class="weekly-rank-min">${formatStudyDuration(c.minutes)}</span>
           </div>
           <div class="weekly-rank-track"><span class="weekly-rank-fill" style="--p:${pct.toFixed(1)}%"></span></div>
         </div>
@@ -1806,6 +2278,7 @@ function liveUpdate() {
       save();
       renderAll();
     }
+    if (state.ui.tab === 'plans') renderPlans();
   }
 
   // 专注倒计时
@@ -1953,13 +2426,16 @@ function renderActiveTab() {
     loadMoods();
   } else if (state.ui.tab === 'stats') {
     renderStats();
+  } else if (state.ui.tab === 'plans') {
+    renderPlans();
+    loadPlans();
   }
 }
 
 // 手动改 hash / 浏览器前进后退时也同步刷新
 window.addEventListener('hashchange', () => {
   const tab = (location.hash || '').replace('#', '');
-  if (!['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats'].includes(tab) || tab === state.ui.tab) return;
+  if (!['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats', 'plans'].includes(tab) || tab === state.ui.tab) return;
   state.ui.tab = tab;
   save();
   switchTab();
@@ -2059,6 +2535,7 @@ function bindCourseListPanel() {
 
 bindFormPanel('task-form-panel', 'task-form-toggle');
 bindFormPanel('course-form-panel', 'course-form-toggle');
+bindFormPanel('plan-form-panel', 'plan-form-toggle');
 bindCourseListPanel();
 
 /* ===== 事件：表单 ===== */
@@ -2415,7 +2892,7 @@ $('week-grid').addEventListener('click', e => {
 
 /* ===== 启动 ===== */
 (function init() {
-  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats'];
+  const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats', 'plans'];
   const hashTab = (location.hash || '').replace('#', '');
   if (TABS.includes(hashTab)) state.ui.tab = hashTab;
   if (!TABS.includes(state.ui.tab)) state.ui.tab = 'dash'; // 旧存档可能停在已删除的倒计时页
@@ -2429,6 +2906,7 @@ $('week-grid').addEventListener('click', e => {
   switchTab();
   renderAll();
   initMoods();
+  initPlans();
   save(); // 持久化一次性迁移标记
   initCloud();
   liveUpdate();
