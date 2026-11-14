@@ -992,43 +992,74 @@ function hashMoodWord(word) {
 }
 
 function extractMoodWords(text) {
-  const words = [];
   const source = String(text || '');
-  let segmented = false;
+  const words = [];
+  const debug = { segmented: false, mode: '', raw: 0, kept: 0, err: '' };
 
-  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+  // ① 优先用浏览器原生分词；但必须校验它“真的产出了词”，
+  //    移动端（iOS Safari / 微信内核）存在 Segmenter 可用却返回空 / 全是非单词项的情况，
+  //    以前只要不抛错就把 segmented 置 true，结果直接返回空数组，树就光秃秃了。
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
     try {
-      const segmenter = new Intl.Segmenter('zh', { granularity: 'word' });
-      for (const part of segmenter.segment(source)) {
-        if (!part.isWordLike) continue;
-        const word = String(part.segment || '').trim();
-        if (/^[\u4e00-\u9fa5]{2,}$/.test(word) && !MOOD_STOP_WORDS.has(word)) {
-          words.push(word);
+      let segmenter = null;
+      // 部分内核只认 'zh-CN' / undefined（按系统语言），逐个兜底
+      for (const loc of ['zh', 'zh-CN', undefined]) {
+        try {
+          segmenter = new Intl.Segmenter(loc, { granularity: 'word' });
+          break;
+        } catch (err) {
+          segmenter = null;
         }
       }
-      segmented = true;
-    } catch (e) {
-      segmented = false;
+      if (segmenter) {
+        for (const part of segmenter.segment(source)) {
+          if (!part || !part.isWordLike) continue;
+          const word = String(part.segment || '').trim();
+          if (/^[\u4e00-\u9fa5]{2,}$/.test(word) && !MOOD_STOP_WORDS.has(word)) {
+            words.push(word);
+            debug.raw++;
+          }
+        }
+      }
+    } catch (err) {
+      debug.err = String((err && err.message) || err);
     }
   }
 
-  if (!segmented) {
+  // ② 原生分词没产出任何词（不支持 / 词典缺失 / 只切出单个字）→ 退回双字 + 单字滑窗
+  if (!words.length) {
+    debug.mode = 'fallback';
     const runs = source.match(/[\u4e00-\u9fa5]{2,}/g) || [];
     for (const run of runs) {
       for (let n = 2; n <= 3; n++) {
         for (let i = 0; i <= run.length - n; i++) {
           const word = run.slice(i, i + n);
-          if (!MOOD_STOP_WORDS.has(word)) words.push(word);
+          if (!MOOD_STOP_WORDS.has(word)) { words.push(word); debug.raw++; }
         }
       }
     }
+    // ③ 还是空（比如原文全是停用词 / 全是英文）：至少把单字也当候选，保证树上有内容
+    if (!words.length) {
+      debug.mode = 'single';
+      const chars = source.match(/[\u4e00-\u9fa5]/g) || [];
+      for (const ch of chars) {
+        if (!MOOD_STOP_WORDS.has(ch)) { words.push(ch); debug.raw++; }
+      }
+    }
+  } else {
+    debug.mode = 'segmenter';
   }
 
   const counts = new Map();
   for (const word of words) counts.set(word, (counts.get(word) || 0) + 1);
-  return Array.from(counts, ([word, count]) => ({ word, count }))
+  const result = Array.from(counts, ([word, count]) => ({ word, count }))
     .sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, 'zh'))
     .slice(0, 10);
+  debug.kept = result.length;
+  // 现场诊断：控制台执行 studyhubMoods.debugWords() 可看到下面这行
+  console.log('[mood-tree] 分词:', debug.mode, '| 候选', debug.raw, '| 保留', debug.kept,
+    debug.err ? ('| error: ' + debug.err) : '', result);
+  return result;
 }
 
 function renderMoodTree() {
@@ -1052,7 +1083,21 @@ function renderMoodTree() {
   // 历史很多时只取最近 100 条，避免一次性处理过多文本
   const history = moodRows.slice(0, 100);
   const source = history.map(m => String(m && m.content || '')).join('\n');
-  const words = extractMoodWords(source);
+  let words = [];
+  try {
+    words = extractMoodWords(source);
+  } catch (err) {
+    console.error('[mood-tree] 分词异常，已兜底', err);
+    words = [];
+  }
+
+  // 兜底：有 ≥3 条记录却一个词都没提取到，直接把最近几条原文截断当“词”显示，别让树空着
+  if (!words.length) {
+    const fallback = history.map(m => String(m && m.content || '').trim()).filter(Boolean).slice(0, 6);
+    words = fallback.map(t => ({ word: t.length > 6 ? t.slice(0, 6) : t, count: 1 }));
+    if (words.length) console.warn('[mood-tree] 未提取到词语，回退显示原文片段', words);
+  }
+
   if (!words.length) {
     cloud.innerHTML = '<p class="mood-tree-empty">继续记录碎碎念，让这棵树长满叶子吧~</p>';
     return;
@@ -1068,11 +1113,13 @@ function renderMoodTree() {
     const radius = 10 + i * 2.7 + (seed % 4);
     const x = Math.min(88, Math.max(12, 50 + Math.cos(angle) * radius * 1.05));
     const y = Math.min(70, Math.max(18, 44 + Math.sin(angle) * radius * 0.72));
+    // 字号 12~24px 按词频插值；全部同频时取中间值 18px
     const size = range > 0 ? Math.round(12 + ((item.count - min) / range) * 12) : 18;
     const rot = ((seed >> 3) % 9) - 4;
     const title = `${item.word} · 出现 ${item.count} 次`;
-    return `<span class="mood-tree-word" style="left:${x.toFixed(1)}%;top:${y.toFixed(1)}%;font-size:${size}px;--rot:${rot}deg" title="${esc(title)}">${esc(item.word)}</span>`;
+    return `<span class="mood-tree-word" style="left:${x.toFixed(1)}%;top:${y.toFixed(1)}%;font-size:${Math.max(12, Math.min(24, size))}px;--rot:${rot}deg" title="${esc(title)}">${esc(item.word)}</span>`;
   }).join('');
+  console.log('[mood-tree] 渲染', words.length, '个词，记录数', total);
 }
 
 function renderMoods() {
@@ -1100,7 +1147,8 @@ function renderMoods() {
     </li>`).join('');
 }
 
-async function loadMoods() {
+async function loadMoods(force) {
+  // force = 强制执行一次云端拉取（移动端切回碎碎念时用，避免只显示旧缓存）
   moodLoading = true;
   renderMoods();
 
@@ -1136,11 +1184,18 @@ async function loadMoods() {
     moodCacheWrite(uid, moodRows);
     renderMoods();
     moodMsg('');
+    if (force) console.log('[mood] 强制刷新完成，记录数', moodRows.length);
   } catch (err) {
     console.warn('[mood] load failed', err);
     if (seq === moodSeq) {
       moodLoading = false;
       if (!moodRows.length) moodMsg(moodErrorText(err));
+      renderMoods();
+    }
+  } finally {
+    // 任何分支都不让“正在唤醒”卡住：卡住时树会一直显示加载提示
+    if (moodLoading) {
+      moodLoading = false;
       renderMoods();
     }
   }
@@ -1264,6 +1319,9 @@ function initMoods() {
   // 先进入“唤醒中”，避免登录状态还没就绪时树被误显示成空树
   moodLoading = true;
   renderMoods();
+  // 启动时主动拉一次：移动端常因为首屏慢、登录回调晚而拿到空数据
+  loadMoods(true);
+  // 兜底解锁：8 秒还没拿到用户就不再显示“正在唤醒”
   setTimeout(() => {
     if (moodLoading && !cloud.user && !window.studyhubUser) {
       moodLoading = false;
@@ -1272,7 +1330,24 @@ function initMoods() {
   }, 8000);
 }
 
-window.studyhubMoods = { reload: loadMoods, add: addMood };
+// 移动端诊断入口：控制台执行 studyhubMoods.debugWords() 查看分词结果
+function moodDebugWords() {
+  const texts = moodRows.map(m => String(m && m.content || ''));
+  const source = texts.slice(0, 100).join('\n');
+  const words = extractMoodWords(source);
+  const info = {
+    records: moodRows.length,
+    joinedLength: source.length,
+    recordsPreview: texts.slice(0, 3),
+    hasIntl: typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function',
+    words,
+    treeHtmlLength: ($('mood-tree-cloud') || {}).innerHTML ? $('mood-tree-cloud').innerHTML.length : 0
+  };
+  console.log('[mood-debug]', JSON.stringify(info, null, 2));
+  return info;
+}
+
+window.studyhubMoods = { reload: loadMoods, add: addMood, debugWords: moodDebugWords };
 
 
 /* ===== 长期计划（plans 表：CRUD 直连 Supabase） ===== */
@@ -3023,8 +3098,8 @@ function renderActiveTab() {
   } else if (state.ui.tab === 'fitness') {
     renderFitness();
   } else if (state.ui.tab === 'mood') {
-    loadMoods();
-    capsuleRender(); // 切回来时按当前系统日期重新判断哪些信已解锁
+    loadMoods(true);              // 切回碎碎念：强制重新拉一次云端，别只显示本机缓存
+    capsuleRender();              // 切回来时按当前系统日期重新判断哪些信已解锁
   } else if (state.ui.tab === 'stats') {
     renderStats();
   } else if (state.ui.tab === 'plans') {
@@ -4999,6 +5074,61 @@ window.studyhubCapsule = {
 };
 
 
+/* ===== 右下角折叠悬浮菜单（纯 UI 收纳：不改动任何业务逻辑） ===== */
+function initFabDock() {
+  const dock = $('fab-dock');
+  const main = $('fab-main');
+  if (!dock || !main) return;
+
+  const isOpen = () => dock.dataset.open === 'true';
+
+  function setOpen(open) {
+    if (open === isOpen()) return;
+    dock.dataset.open = open ? 'true' : 'false';
+    main.setAttribute('aria-expanded', open ? 'true' : 'false');
+    main.setAttribute('aria-label', open ? '收起快捷工具' : '打开快捷工具');
+    // 收起时顺手关闭已经展开的白噪音面板，避免下次点开时它盖住其它球
+    if (!open) {
+      const noise = $('noise-fab');
+      if (noise && noise.open) noise.open = false;
+    }
+  }
+
+  main.addEventListener('click', e => {
+    e.stopPropagation();
+    setOpen(!isOpen());
+  });
+
+  // 点击页面其他空白处收起（点菜单内部不收起）
+  document.addEventListener('click', e => {
+    if (!isOpen()) return;
+    if (e.target === main) return;
+    if (e.target && e.target.closest && e.target.closest('#fab-dock')) return;
+    setOpen(false);
+  });
+
+  // Esc 收起
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && isOpen()) setOpen(false);
+  });
+
+  // 进入全屏自习室时强制收起
+  const enterBtn = $('studyroom-btn');
+  if (enterBtn) enterBtn.addEventListener('click', () => setOpen(false));
+
+  // 监听自习室开合：打开时收起并隐藏（自习室本身 z-index 更高，这里双保险）
+  const html = document.documentElement;
+  if (typeof MutationObserver === 'function') {
+    new MutationObserver(() => {
+      const open = html.classList.contains('studyroom-open');
+      dock.classList.toggle('is-hidden-in-studyroom', open);
+      if (open) setOpen(false);
+    }).observe(html, { attributes: true, attributeFilter: ['class'] });
+  }
+
+  window.studyhubFab = { open: () => setOpen(true), close: () => setOpen(false), toggle: () => setOpen(!isOpen()) };
+}
+
 /* ===== 启动 ===== */
 (function init() {
   const TABS = ['dash', 'courses', 'tasks', 'fitness', 'mood', 'stats', 'plans'];
@@ -5026,6 +5156,7 @@ window.studyhubCapsule = {
   initCapsules();
   initFortune();
   initFx();
+  initFabDock();
   save(); // 持久化一次性迁移标记
   initCloud();
   liveUpdate();

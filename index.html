@@ -8,7 +8,7 @@
 <meta http-equiv="Expires" content="0">
 <title>学习管理 · 考公 / 四级 / 课表</title>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<link rel="stylesheet" href="style.css?v=20261115n">
+<link rel="stylesheet" href="style.css?v=20261115q">
 <script src="theme.js?v=20261106a"></script>
 </head>
 <body>
@@ -592,70 +592,105 @@
 <div id="sticky-layer" class="sticky-layer" aria-label="桌面便签"></div>
 <div id="sticky-hint" class="sticky-hint" role="status">双击空白处，贴一张便签 ✎</div>
 
-<!-- 白噪音 · 黑胶唱片混音器 -->
-<details class="noise-fab" id="noise-fab">
-  <summary class="noise-fab-btn" aria-label="白噪音混音器">
-    <span class="fab-icon" aria-hidden="true">🎵</span>
-    <span class="fab-close" aria-hidden="true">✕</span>
-  </summary>
-  <div class="noise-menu" role="group" aria-label="白噪音混音器">
-    <!-- 黑胶唱机 -->
-    <div class="vinyl-deck" id="vinyl-deck" data-playing="false">
-      <div class="vinyl-disc" id="vinyl-disc" aria-hidden="true">
-        <span class="vinyl-groove"></span>
-        <span class="vinyl-label"><i>FOCUS</i><b>33⅓</b></span>
-        <span class="vinyl-hole"></span>
+
+
+
+
+<!-- 右下角折叠悬浮菜单：主按钮 + 4 个收纳球（白噪音 / 木鱼 / 水滴 / 盆栽） -->
+<div id="fab-dock" class="fab-dock" data-open="false">
+  <button id="fab-main" class="fab-main" type="button"
+    aria-label="打开快捷工具" aria-expanded="false" aria-controls="fab-group"
+    title="更多小工具（白噪音 · 木鱼 · 喝水提醒 · 小盆栽）">
+    <span class="fab-main-icon" aria-hidden="true">🪄</span>
+  </button>
+  <div id="fab-group" class="fab-group" role="group" aria-label="快捷工具">
+    <!-- 白噪音 · 黑胶唱片混音器 -->
+    <details class="noise-fab" id="noise-fab">
+      <summary class="noise-fab-btn" aria-label="白噪音混音器">
+        <span class="fab-icon" aria-hidden="true">🎵</span>
+        <span class="fab-close" aria-hidden="true">✕</span>
+      </summary>
+      <div class="noise-menu" role="group" aria-label="白噪音混音器">
+        <!-- 黑胶唱机 -->
+        <div class="vinyl-deck" id="vinyl-deck" data-playing="false">
+          <div class="vinyl-disc" id="vinyl-disc" aria-hidden="true">
+            <span class="vinyl-groove"></span>
+            <span class="vinyl-label"><i>FOCUS</i><b>33⅓</b></span>
+            <span class="vinyl-hole"></span>
+          </div>
+          <div class="vinyl-tonearm" id="vinyl-tonearm" aria-hidden="true">
+            <span class="vinyl-pivot"></span>
+            <span class="vinyl-arm"></span>
+            <span class="vinyl-head"></span>
+          </div>
+          <button class="vinyl-power" id="vinyl-power" type="button" aria-pressed="false"
+            title="播放 / 暂停全部混音" aria-label="播放或暂停混音">
+            <span class="vinyl-power-icon" aria-hidden="true">▶</span>
+          </button>
+        </div>
+
+        <!-- 三路音轨混音 -->
+        <!-- 测试音源来自 Mixkit，正式使用可替换成自托管 mp3 -->
+        <div class="mixer" id="mixer">
+          <label class="mix-row" data-track="rain">
+            <span class="mix-name"><span class="mix-emoji" aria-hidden="true">🌧️</span>雨声</span>
+            <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
+              data-src="https://assets.mixkit.co/active_storage/sfx/2393/2393-preview.mp3"
+              aria-label="雨声音量">
+            <span class="mix-val" id="mix-val-rain">0%</span>
+          </label>
+          <label class="mix-row" data-track="cafe">
+            <span class="mix-name"><span class="mix-emoji" aria-hidden="true">☕</span>咖啡馆</span>
+            <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
+              data-src="https://assets.mixkit.co/active_storage/sfx/444/444-preview.mp3"
+              aria-label="咖啡馆音量">
+            <span class="mix-val" id="mix-val-cafe">0%</span>
+          </label>
+          <label class="mix-row" data-track="wave">
+            <span class="mix-name"><span class="mix-emoji" aria-hidden="true">🌊</span>海浪</span>
+            <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
+              data-src="https://assets.mixkit.co/active_storage/sfx/1196/1196-preview.mp3"
+              aria-label="海浪音量">
+            <span class="mix-val" id="mix-val-wave">0%</span>
+          </label>
+        </div>
+        <p class="noise-hint" id="noise-hint" role="status">拖动滑杆开始混音</p>
+        <audio class="mix-audio" data-track="rain" loop preload="none"></audio>
+        <audio class="mix-audio" data-track="cafe" loop preload="none"></audio>
+        <audio class="mix-audio" data-track="wave" loop preload="none"></audio>
       </div>
-      <div class="vinyl-tonearm" id="vinyl-tonearm" aria-hidden="true">
-        <span class="vinyl-pivot"></span>
-        <span class="vinyl-arm"></span>
-        <span class="vinyl-head"></span>
-      </div>
-      <button class="vinyl-power" id="vinyl-power" type="button" aria-pressed="false"
-        title="播放 / 暂停全部混音" aria-label="播放或暂停混音">
-        <span class="vinyl-power-icon" aria-hidden="true">▶</span>
-      </button>
+    </details>
+
+    <!-- 赛博木鱼（纯前端音效 + localStorage 计数） -->
+    <div id="woodfish" class="woodfish" role="button" tabindex="0"
+      aria-label="赛博木鱼：点击敲击，积累功德" aria-describedby="woodfish-tip">
+      <div class="wf-bubbles" id="wf-bubbles" aria-hidden="true"></div>
+      <span class="wf-float" id="wf-today">0</span>
+      <span class="wf-body" aria-hidden="true">🪵</span>
+      <span class="wf-tip" id="woodfish-tip" role="tooltip">今日功德 0 · 累计 0</span>
     </div>
 
-    <!-- 三路音轨混音 -->
-    <!-- 测试音源来自 Mixkit，正式使用可替换成自托管 mp3 -->
-    <div class="mixer" id="mixer">
-      <label class="mix-row" data-track="rain">
-        <span class="mix-name"><span class="mix-emoji" aria-hidden="true">🌧️</span>雨声</span>
-        <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
-          data-src="https://assets.mixkit.co/active_storage/sfx/2393/2393-preview.mp3"
-          aria-label="雨声音量">
-        <span class="mix-val" id="mix-val-rain">0%</span>
-      </label>
-      <label class="mix-row" data-track="cafe">
-        <span class="mix-name"><span class="mix-emoji" aria-hidden="true">☕</span>咖啡馆</span>
-        <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
-          data-src="https://assets.mixkit.co/active_storage/sfx/444/444-preview.mp3"
-          aria-label="咖啡馆音量">
-        <span class="mix-val" id="mix-val-cafe">0%</span>
-      </label>
-      <label class="mix-row" data-track="wave">
-        <span class="mix-name"><span class="mix-emoji" aria-hidden="true">🌊</span>海浪</span>
-        <input class="mix-slider" type="range" min="0" max="100" step="1" value="0"
-          data-src="https://assets.mixkit.co/active_storage/sfx/1196/1196-preview.mp3"
-          aria-label="海浪音量">
-        <span class="mix-val" id="mix-val-wave">0%</span>
-      </label>
+    <!-- 久坐 / 喝水提醒悬浮球（与白噪音、木鱼并排） -->
+    <div id="hydrate-fab" class="hydrate-fab" role="button" tabindex="0"
+      aria-pressed="false" aria-label="喝水提醒：未开启，点击开启" aria-describedby="hydrate-tip">
+      <span class="hydrate-icon" aria-hidden="true">💧</span>
+      <span class="hydrate-dot" aria-hidden="true"></span>
+      <span class="hydrate-tip" id="hydrate-tip" role="tooltip">喝水提醒：未开启<br>点击开启 · 每 45 分钟提醒一次</span>
     </div>
-    <p class="noise-hint" id="noise-hint" role="status">拖动滑杆开始混音</p>
-    <audio class="mix-audio" data-track="rain" loop preload="none"></audio>
-    <audio class="mix-audio" data-track="cafe" loop preload="none"></audio>
-    <audio class="mix-audio" data-track="wave" loop preload="none"></audio>
+
+    <!-- 桌面像素小盆栽：根据今日专注时长成长 -->
+    <div id="plant-fab" class="plant-fab" role="img" tabindex="0"
+      aria-label="今日专注 0 分钟的小盆栽" aria-describedby="plant-tip">
+      <div class="plant-stage" data-stage="0">
+        <span class="plant-leaf leaf-a" aria-hidden="true">🌱</span>
+        <span class="plant-leaf leaf-b" aria-hidden="true">🌱</span>
+        <span class="plant-leaf leaf-c" aria-hidden="true">🌿</span>
+        <span class="plant-bloom" aria-hidden="true">🌸</span>
+        <span class="plant-pot" aria-hidden="true"></span>
+      </div>
+      <span class="plant-tip" id="plant-tip" role="tooltip">今日专注 0 分钟，小盆栽正在努力生长哦！</span>
+    </div>
   </div>
-</details>
-
-<!-- 赛博木鱼（纯前端音效 + localStorage 计数） -->
-<div id="woodfish" class="woodfish" role="button" tabindex="0"
-  aria-label="赛博木鱼：点击敲击，积累功德" aria-describedby="woodfish-tip">
-  <div class="wf-bubbles" id="wf-bubbles" aria-hidden="true"></div>
-  <span class="wf-float" id="wf-today">0</span>
-  <span class="wf-body" aria-hidden="true">🪵</span>
-  <span class="wf-tip" id="woodfish-tip" role="tooltip">今日功德 0 · 累计 0</span>
 </div>
 
 <!-- 全局粒子特效层：pointer-events: none，不影响任何交互 -->
@@ -686,26 +721,9 @@
   </div>
 </div>
 
-<!-- 桌面像素小盆栽：根据今日专注时长成长 -->
-<div id="plant-fab" class="plant-fab" role="img" tabindex="0"
-  aria-label="今日专注 0 分钟的小盆栽" aria-describedby="plant-tip">
-  <div class="plant-stage" data-stage="0">
-    <span class="plant-leaf leaf-a" aria-hidden="true">🌱</span>
-    <span class="plant-leaf leaf-b" aria-hidden="true">🌱</span>
-    <span class="plant-leaf leaf-c" aria-hidden="true">🌿</span>
-    <span class="plant-bloom" aria-hidden="true">🌸</span>
-    <span class="plant-pot" aria-hidden="true"></span>
-  </div>
-  <span class="plant-tip" id="plant-tip" role="tooltip">今日专注 0 分钟，小盆栽正在努力生长哦！</span>
-</div>
 
-<!-- 久坐 / 喝水提醒悬浮球（与白噪音、木鱼并排） -->
-<div id="hydrate-fab" class="hydrate-fab" role="button" tabindex="0"
-  aria-pressed="false" aria-label="喝水提醒：未开启，点击开启" aria-describedby="hydrate-tip">
-  <span class="hydrate-icon" aria-hidden="true">💧</span>
-  <span class="hydrate-dot" aria-hidden="true"></span>
-  <span class="hydrate-tip" id="hydrate-tip" role="tooltip">喝水提醒：未开启<br>点击开启 · 每 45 分钟提醒一次</span>
-</div>
+
+
 
 <!-- 沉浸式专注计时器 -->
 <div id="focus-panel" class="focus-panel hidden" aria-live="polite">
@@ -755,7 +773,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20261115o"></script>
+<script src="app.js?v=20261115q"></script>
 <script>
 /* 仪表盘专注目标进度：只读取 localStorage，目标值也只存在本机 */
 (function () {
