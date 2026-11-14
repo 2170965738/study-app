@@ -123,6 +123,7 @@ const cloud = {
   client: null,
   user: null,
   channel: null,
+  stickyChannel: null,     // 便签 / 时间胶囊 的独立 Realtime 通道
   pushing: false,
   pendingPush: false,
   pushTimer: 0,
@@ -163,6 +164,23 @@ function syncToast(text) {
   el.style.display = 'block';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4200);
+}
+
+// 右上角提醒 Toast：与底部 syncToast 同一套毛玻璃外观，只是位置和出场方向不同
+// 独立节点，不与底部的 syncToast 抢同一个元素
+let cornerToastTimer = 0;
+function cornerToast(text, ms) {
+  let el = document.getElementById('corner-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'corner-toast';
+    el.setAttribute('role', 'status');
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(cornerToastTimer);
+  cornerToastTimer = setTimeout(() => { el.classList.remove('show'); }, ms || 5200);
 }
 
 function taskToRow(t, uid) {
@@ -813,13 +831,32 @@ function subscribeRealtime() {
     .subscribe();
 }
 
+/* ---- 便签 / 时间胶囊：独立的 Realtime 通道，与上面的任务通道互不影响 ---- */
+function subscribeStickyRealtime() {
+  if (!cloud.client || !cloud.user) return;
+  if (cloud.stickyChannel) { cloud.client.removeChannel(cloud.stickyChannel); cloud.stickyChannel = null; }
+  const uid = cloud.user.id;
+  // 本端刚改过时忽略自己触发的回声，避免抖动
+  const ignore = () => stickySync.pending.size > 0 || stickySync.loading;
+  cloud.stickyChannel = cloud.client
+    .channel('studyhub-stickies-' + uid)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'stickies', filter: `user_id=eq.${uid}` },
+      () => { if (!ignore()) stickyPull(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'time_capsules', filter: `user_id=eq.${uid}` },
+      () => { if (!ignore()) capsulePull(); })
+    .subscribe();
+}
+
 function handleAuthUser(user) {
   const prevId = cloud.user && cloud.user.id;
   cloud.user = user || null;
   if (!user) {
     if (cloud.client && cloud.channel) { cloud.client.removeChannel(cloud.channel); cloud.channel = null; }
+    if (cloud.client && cloud.stickyChannel) { cloud.client.removeChannel(cloud.stickyChannel); cloud.stickyChannel = null; }
     onMoodAuth(null);
     onPlansAuth(null);
+    stickyResetLocal();
+    capsuleResetLocal();
     return;
   }
   if (prevId !== user.id) {
@@ -839,6 +876,10 @@ function handleAuthUser(user) {
     subscribeRealtime();
     onMoodAuth(user);
     onPlansAuth(user);
+    // 便签与时间胶囊：登录后拉云端（云端为空则自动迁移本机数据）
+    stickyPull();
+    capsulePull();
+    subscribeStickyRealtime();
   }
 }
 
@@ -1559,6 +1600,8 @@ function initPlans() {
 window.studyhubPlans = { reload: loadPlans, state: () => planRows };
 
 
+
+
 /* ===== 空闲时段 ===== */
 function busyBlocks(dateStr) {
   const wd = weekdayOf(dateStr);
@@ -2024,7 +2067,387 @@ function renderCountdown() {
   if (document.activeElement !== $('gk-date')) $('gk-date').value = state.exams.guokao || '';
   if (document.activeElement !== $('sk-date')) $('sk-date').value = state.exams.shengkao || '';
   document.querySelectorAll('[data-cd]').forEach(el => { el.textContent = cdText(state.exams[el.dataset.cd]); });
+  renderCustomCountdowns();
 }
+
+
+/* ===== 自定义倒计时（仅本机 localStorage，不进 Supabase） ===== */
+const CD_KEY = 'studyhub.customCountdowns';
+const CD_MAX = 12;          // 顶栏放不下太多，最多 12 个
+const CD_NAME_MAX = 20;
+let cdModalIndex = -1;      // 正在编辑的倒计时下标；-1 表示新增
+let cdMsgTimer = 0;
+
+// 两个日期之间差几天：按“日期”而不是“时刻”计算，避免时区与时分误差
+function cdDaysLeft(dateStr) {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(dateStr || '').trim());
+  if (!m) return null;
+  const target = new Date(+m[1], +m[2] - 1, +m[3]);
+  if (isNaN(target.getTime())) return null;
+  const today = parseDate(todayStr());
+  return Math.round((target - today) / 86400000);
+}
+
+function cdListRead() {
+  let raw = [];
+  try { raw = JSON.parse(localStorage.getItem(CD_KEY) || '[]'); } catch (e) { raw = []; }
+  return (Array.isArray(raw) ? raw : [])
+    .filter(it => it && typeof it === 'object' && it.name && /^\d{4}-\d{2}-\d{2}$/.test(String(it.date || '')))
+    .map(it => ({
+      id: String(it.id || uid()),
+      name: String(it.name).trim().slice(0, CD_NAME_MAX),
+      date: String(it.date)
+    }));
+}
+
+function cdListWrite(list) {
+  try { localStorage.setItem(CD_KEY, JSON.stringify(list)); }
+  catch (e) { console.warn('[countdown] 保存失败', e); }
+}
+
+// 把自定义倒计时条贴到「省考倒计时」右侧：量出它的实际宽度写进 CSS 变量
+// （倒计时数字每秒变宽变窄，所以每次渲染与每秒刷新都量一次，失败就保持原值）
+function cdSyncOffset() {
+  const pill = document.querySelector('.top-exam');
+  const wrap = $('top-cds');
+  if (!pill || !wrap || !pill.getBoundingClientRect) return;
+  const w = pill.getBoundingClientRect().width;
+  if (w > 0) wrap.style.setProperty('--top-exam-w', Math.ceil(w) + 'px');
+}
+
+function cdItemMeta(left) {
+  if (left == null) return { cls: 'is-invalid', num: '--', unit: '', label: '日期无效' };
+  if (left > 0) return { cls: '', num: String(left), unit: '天', label: '' };
+  if (left === 0) return { cls: 'is-today', num: '今天', unit: '', label: '就是今天！' };
+  return { cls: 'is-past', num: String(-left), unit: '天', label: '已过去' };
+}
+
+function renderCustomCountdowns() {
+  const list = $('top-cd-list');
+  if (!list) return;
+  const items = cdListRead();
+  const wrap = $('top-cds');
+  if (wrap) wrap.classList.toggle('has-items', items.length > 0);
+  cdSyncOffset();
+  const addBtn = $('top-cd-add');
+  if (addBtn) {
+    const full = items.length >= CD_MAX;
+    addBtn.disabled = full;
+    addBtn.title = full ? `最多添加 ${CD_MAX} 个倒计时` : '添加倒计时';
+  }
+  if (!items.length) {
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = items.map((it, i) => {
+    const left = cdDaysLeft(it.date);
+    const meta = cdItemMeta(left);
+    const title = `${esc(it.name)} · ${it.date}${meta.label ? ' · ' + meta.label : ''}`;
+    return `<span class="top-cd ${meta.cls}" role="listitem" data-cd-id="${esc(it.id)}" title="${title}">
+        <span class="top-cd-name">${esc(it.name)}</span>
+        <span class="top-cd-num">${meta.num}<i>${meta.unit}</i></span>
+        <button class="top-cd-del" type="button" data-cd-del="${esc(it.id)}" data-cd-index="${i}"
+          title="删除「${esc(it.name)}」" aria-label="删除倒计时 ${esc(it.name)}">×</button>
+      </span>`;
+  }).join('');
+}
+
+function cdSetMsg(text, ok) {
+  const el = $('cd-msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
+  clearTimeout(cdMsgTimer);
+  if (text) cdMsgTimer = setTimeout(() => { el.textContent = ''; }, 4000);
+}
+
+function openCdModal() {
+  const modal = $('cd-modal');
+  if (!modal) return;
+  if (cdListRead().length >= CD_MAX) { syncToast(`最多添加 ${CD_MAX} 个倒计时`); return; }
+  cdModalIndex = -1;
+  const form = $('cd-form');
+  if (form) form.reset();
+  const nameEl = $('cd-name');
+  const dateEl = $('cd-date');
+  if (dateEl) {
+    const t = todayStr();
+    dateEl.min = t;                       // 只能选今天或以后
+    dateEl.value = addDays(t, 30);        // 默认一个月后，省得手动翻日历
+  }
+  cdSetMsg('');
+  modal.classList.remove('hidden');
+  if (nameEl) setTimeout(() => { try { nameEl.focus(); } catch (e) { /* 忽略 */ } }, 60);
+}
+
+function closeCdModal() {
+  const modal = $('cd-modal');
+  if (modal) modal.classList.add('hidden');
+  cdSetMsg('');
+}
+
+function submitCdForm(e) {
+  e.preventDefault();
+  const name = String(($('cd-name') || {}).value || '').trim().slice(0, CD_NAME_MAX);
+  const date = String(($('cd-date') || {}).value || '').trim();
+  if (!name) { cdSetMsg('先给倒计时起个名字吧'); return; }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { cdSetMsg('请选择一个目标日期'); return; }
+  const left = cdDaysLeft(date);
+  if (left == null) { cdSetMsg('日期格式不对，请重新选择'); return; }
+  if (left < 0) { cdSetMsg('目标日期不能早于今天～'); return; }
+
+  const list = cdListRead();
+  if (list.some(it => it.name === name && it.date === date)) {
+    cdSetMsg('已经有一个同名同日期的倒计时啦');
+    return;
+  }
+  if (list.length >= CD_MAX) { cdSetMsg(`最多添加 ${CD_MAX} 个倒计时`); return; }
+
+  list.push({ id: uid(), name, date });
+  list.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, 'zh'));
+  cdListWrite(list);
+  closeCdModal();
+  renderCustomCountdowns();
+  syncToast(left === 0 ? `「${name}」就是今天，加油！` : `已添加：距离「${name}」还有 ${left} 天`);
+}
+
+function deleteCd(id) {
+  const list = cdListRead();
+  const item = list.find(it => it.id === String(id));
+  if (!item) return;
+  if (!window.confirm(`删除倒计时「${item.name}」？`)) return;
+  cdListWrite(list.filter(it => it.id !== String(id)));
+  renderCustomCountdowns();
+  syncToast(`已删除倒计时「${item.name}」`);
+}
+
+function initCustomCountdowns() {
+  const addBtn = $('top-cd-add');
+  const list = $('top-cd-list');
+  const modal = $('cd-modal');
+  const form = $('cd-form');
+  if (addBtn) addBtn.addEventListener('click', openCdModal);
+  if (list) {
+    // 点 × 删除；点卡片其它位置只是看信息，不做操作
+    list.addEventListener('click', e => {
+      const del = e.target.closest('[data-cd-del]');
+      if (del) { e.stopPropagation(); deleteCd(del.dataset.cdDel); }
+    });
+  }
+  if (form) form.addEventListener('submit', submitCdForm);
+  const closeBtn = $('cd-close');
+  const cancelBtn = $('cd-cancel');
+  if (closeBtn) closeBtn.addEventListener('click', closeCdModal);
+  if (cancelBtn) cancelBtn.addEventListener('click', closeCdModal);
+  if (modal) modal.addEventListener('click', e => { if (e.target === modal) closeCdModal(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal && !modal.classList.contains('hidden')) closeCdModal();
+  });
+  renderCustomCountdowns();
+}
+
+window.studyhubCountdowns = {
+  list: cdListRead,
+  render: renderCustomCountdowns,
+  add: (name, date) => cdListWrite(cdListRead().concat({ id: uid(), name, date }))
+};
+
+
+/* ===== 每日微习惯（仅本机 localStorage；每天按日期自动重置勾选） ===== */
+const HABIT_KEY = 'studyhub.habits';           // { date: 'YYYY-MM-DD', items: [{ id, name, done }] }
+const HABIT_MAX = 20;
+const HABIT_NAME_MAX = 16;
+let habitTodayCache = '';
+let habitCheckedAt = 0;
+let habitPendingDelete = null;
+let habitFlashTimer = 0;
+
+// 读取时做两件事：① 日期不是今天就整体重置勾选；② 兼容旧的纯字符串数组
+function habitsRead() {
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(HABIT_KEY) || 'null'); } catch (e) { raw = null; }
+  const today = todayStr();
+  habitTodayCache = today;
+
+  if (Array.isArray(raw)) raw = { date: today, items: raw };
+  if (!raw || typeof raw !== 'object') raw = { date: today, items: [] };
+  const items = (Array.isArray(raw.items) ? raw.items : [])
+    .map(it => (typeof it === 'string'
+      ? { id: uid(), name: String(it).trim(), done: false }
+      : { id: String((it && it.id) || uid()), name: String((it && it.name) || '').trim(), done: !!(it && it.done) }))
+    .filter(it => it.name);
+
+  const sameDay = raw.date === today;
+  const list = {
+    date: today,
+    items: items.map(it => ({ id: it.id, name: it.name, done: sameDay ? !!it.done : false }))
+  };
+  // 跨天时立即把“全部未完成”的新状态写回，避免刷新前又被旧勾选复活
+  if (!sameDay && Array.isArray(raw.items) && raw.items.length) habitsWrite(list, 'silent');
+  return list;
+}
+
+function habitsWrite(list) {
+  habitTodayCache = list.date || todayStr();
+  try { localStorage.setItem(HABIT_KEY, JSON.stringify(list)); }
+  catch (e) { console.warn('[habit] 保存失败', e); }
+}
+
+function habitsSave(items) {
+  habitsWrite({ date: todayStr(), items });
+  renderHabits();
+}
+
+// 跨天检测：跨过零点就重绘一次（liveUpdate 每秒调用）
+function habitsTick() {
+  const now = Date.now();
+  if (now - habitCheckedAt < 1000) return;
+  habitCheckedAt = now;
+  if (habitTodayCache && habitTodayCache !== todayStr()) renderHabits();
+}
+
+function habitEncourage(done, total) {
+  if (!total) return '还没有微习惯，点右上角的 ＋ 加一个吧 🌱';
+  if (done >= total) return `今日 ${done} / ${total} 个小习惯全部完成，太棒啦！🎉`;
+  if (done === 0) return `今日已完成 0 / ${total} 个微习惯，先从一件小事开始吧 🌱`;
+  if (done / total >= 0.5) return `今日已完成 ${done} / ${total} 个微习惯，继续保持！`;
+  return `今日已完成 ${done} / ${total} 个微习惯，再坚持一下下 💪`;
+}
+
+function renderHabits() {
+  const listEl = $('habit-list');
+  if (!listEl) return;
+  const list = habitsRead();
+  const items = list.items;
+  const done = items.filter(it => it.done).length;
+
+  const sub = $('habit-sub');
+  if (sub) sub.textContent = habitEncourage(done, items.length);
+  const addBtn = $('habit-add');
+  if (addBtn) addBtn.disabled = items.length >= HABIT_MAX;
+
+  if (!items.length) {
+    listEl.innerHTML = `<li class="habit-empty">还没有微习惯～点右上角 ＋ 添加「不熬夜」「喝八杯水」这样的小事</li>`;
+    return;
+  }
+  listEl.innerHTML = items.map(it => `<li class="habit-item${it.done ? ' is-done' : ''}" data-habit-id="${esc(it.id)}">
+      <button class="habit-check" type="button" data-habit-toggle="${esc(it.id)}"
+        role="checkbox" aria-checked="${it.done ? 'true' : 'false'}"
+        aria-label="${esc(it.name)}${it.done ? '（已完成）' : '（未完成）'}">
+        <span class="habit-check-icon" aria-hidden="true">✓</span>
+      </button>
+      <span class="habit-name">${esc(it.name)}</span>
+      <button class="habit-del" type="button" data-habit-del="${esc(it.id)}"
+        title="删除「${esc(it.name)}」" aria-label="删除微习惯 ${esc(it.name)}">×</button>
+    </li>`).join('');
+  // 全部完成时给顶部一句小彩带式反馈
+  if (done === items.length && done > 0) {
+    listEl.classList.add('is-all-done');
+    clearTimeout(habitFlashTimer);
+    habitFlashTimer = setTimeout(() => listEl.classList.remove('is-all-done'), 1200);
+  }
+}
+
+function toggleHabit(id) {
+  const list = habitsRead();
+  const hit = list.items.find(it => it.id === String(id));
+  if (!hit) return;
+  // 跨天后的第一次点击：habitsRead 已把旧勾选重置，直接基于新状态翻转
+  hit.done = !hit.done;
+  habitsSave(list.items);
+  if (hit.done) syncToast(`「${hit.name}」完成啦 🌱`);
+}
+
+function addHabit(name) {
+  const value = String(name || '').trim().slice(0, HABIT_NAME_MAX);
+  if (!value) { syncToast('先写一个习惯名字吧'); return false; }
+  const list = habitsRead();
+  if (list.items.some(it => it.name === value)) { syncToast('这个习惯已经在列表里啦'); return false; }
+  if (list.items.length >= HABIT_MAX) { syncToast(`最多 ${HABIT_MAX} 个微习惯`); return false; }
+  list.items.push({ id: uid(), name: value, done: false });
+  habitsSave(list.items);
+  syncToast(`已添加微习惯「${value}」`);
+  return true;
+}
+
+function askDeleteHabit(id) {
+  const list = habitsRead();
+  const hit = list.items.find(it => it.id === String(id));
+  if (!hit) return;
+  habitPendingDelete = hit.id;
+  const box = $('habit-alert');
+  const msg = $('habit-alert-msg');
+  if (msg) msg.textContent = `删除后「${hit.name}」会从列表里消失，今天的打卡记录也会一并清掉。`;
+  if (box) box.classList.remove('hidden');
+}
+
+function closeHabitAlert() {
+  habitPendingDelete = null;
+  const box = $('habit-alert');
+  if (box) box.classList.add('hidden');
+}
+
+function confirmDeleteHabit() {
+  const id = habitPendingDelete;
+  closeHabitAlert();
+  if (!id) return;
+  const list = habitsRead();
+  const hit = list.items.find(it => it.id === id);
+  habitsSave(list.items.filter(it => it.id !== id));
+  if (hit) syncToast(`已删除微习惯「${hit.name}」`);
+}
+
+function toggleHabitForm(open) {
+  const wrap = $('habit-form-wrap');
+  const input = $('habit-input');
+  if (!wrap) return;
+  const show = open === undefined ? wrap.classList.contains('hidden') : !!open;
+  wrap.classList.toggle('hidden', !show);
+  const addBtn = $('habit-add');
+  if (addBtn) addBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
+  if (show && input) setTimeout(() => { try { input.focus(); } catch (e) { /* 忽略 */ } }, 60);
+  if (!show && input) input.value = '';
+}
+
+function initHabits() {
+  const list = $('habit-list');
+  const form = $('habit-form');
+  if (!list) return;
+  list.addEventListener('click', e => {
+    const check = e.target.closest('[data-habit-toggle]');
+    if (check) { toggleHabit(check.dataset.habitToggle); return; }
+    const del = e.target.closest('[data-habit-del]');
+    if (del) askDeleteHabit(del.dataset.habitDel);
+  });
+  const addBtn = $('habit-add');
+  if (addBtn) addBtn.addEventListener('click', () => toggleHabitForm());
+  if (form) {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const input = $('habit-input');
+      if (addHabit(input && input.value)) toggleHabitForm(false);
+    });
+  }
+  const cancelBtn = $('habit-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => toggleHabitForm(false));
+  const alertBox = $('habit-alert');
+  const okBtn = $('habit-alert-ok');
+  const noBtn = $('habit-alert-cancel');
+  if (okBtn) okBtn.addEventListener('click', confirmDeleteHabit);
+  if (noBtn) noBtn.addEventListener('click', closeHabitAlert);
+  if (alertBox) alertBox.addEventListener('click', e => { if (e.target === alertBox) closeHabitAlert(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && alertBox && !alertBox.classList.contains('hidden')) closeHabitAlert();
+  });
+  renderHabits();
+}
+
+window.studyhubHabits = {
+  list: () => habitsRead().items,
+  add: addHabit,
+  toggle: toggleHabit,
+  render: renderHabits
+};
 
 /* ===== 学习足迹（最近 12 周热力图） ===== */
 let heatToday = '';
@@ -2252,6 +2675,159 @@ function renderAll() {
   renderFocus();
 }
 
+/* ===== 全屏沉浸自习室
+   只做视觉层面的覆盖：不改 state、不碰同步、不重建任何页面。
+   退出时只需移除 .studyroom-open，原有布局与状态自动复原。 ===== */
+const studyroom = {
+  open: false,
+  prevScroll: 0,
+  keyHandler: null,
+  fsHandler: null,
+  raf: 0
+};
+
+function srClockText(d) {
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// 用 requestAnimationFrame 对齐到整秒边界刷新，比 setInterval 更准（不会跳秒）
+function srTick() {
+  if (!studyroom.open) return;
+  const el = $('sr-clock');
+  const now = new Date();
+  if (el) {
+    const text = srClockText(now);
+    if (el.textContent !== text) el.textContent = text;
+  }
+  const wait = 1000 - now.getMilliseconds();
+  studyroom.raf = setTimeout(() => {
+    studyroom.raf = requestAnimationFrame(srTick);
+  }, wait);
+}
+
+function srStopTick() {
+  if (studyroom.raf) {
+    clearTimeout(studyroom.raf);
+    studyroom.raf = 0;
+  }
+}
+
+function srCurrentFullscreenEl() {
+  try {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function srRequestFullscreen() {
+  const el = document.documentElement;
+  try {
+    const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!fn) return; // 不支持全屏时只做沉浸层，不影响功能
+    const ret = fn.call(el);
+    if (ret && typeof ret.catch === 'function') ret.catch(() => { /* 被浏览器策略拒绝，忽略 */ });
+  } catch (e) {
+    /* iframe / 权限限制下会抛错，静默忽略 */
+  }
+}
+
+function srExitFullscreen() {
+  try {
+    if (!srCurrentFullscreenEl()) return;
+    const fn = document.exitFullscreen || document.webkitExitFullscreen;
+    if (!fn) return;
+    const ret = fn.call(document);
+    if (ret && typeof ret.catch === 'function') ret.catch(() => { /* 忽略 */ });
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+function enterStudyroom() {
+  if (studyroom.open) return;
+  const layer = $('studyroom');
+  if (!layer) return;
+
+  // 记下滚动位置，退出后原样还原；同时锁住背景滚动
+  studyroom.prevScroll = window.pageYOffset || document.documentElement.scrollTop || 0;
+  studyroom.open = true;
+  document.documentElement.classList.add('studyroom-open');
+  document.body.classList.add('studyroom-open');
+  layer.classList.remove('hidden');
+
+  const clock = $('sr-clock');
+  if (clock) clock.textContent = srClockText(new Date());
+  srTick();
+
+  srRequestFullscreen();
+
+  // ESC 自己处理：浏览器全屏时 ESC 会先被浏览器吞掉，所以要兜底
+  studyroom.keyHandler = e => {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return;
+    e.preventDefault();
+    exitStudyroom();
+  };
+  document.addEventListener('keydown', studyroom.keyHandler, true);
+
+  // 用户按 F11 / 浏览器原生方式退出全屏时，同步收起沉浸层，避免“半退出”
+  studyroom.fsHandler = () => {
+    if (!studyroom.open) return;
+    if (!srCurrentFullscreenEl()) exitStudyroom();
+  };
+  document.addEventListener('fullscreenchange', studyroom.fsHandler);
+  document.addEventListener('webkitfullscreenchange', studyroom.fsHandler);
+
+  try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch (e) { window.scrollTo(0, 0); }
+}
+
+function exitStudyroom() {
+  if (!studyroom.open) return;
+  studyroom.open = false;
+  srStopTick();
+
+  const layer = $('studyroom');
+  if (layer) layer.classList.add('hidden');
+  document.documentElement.classList.remove('studyroom-open');
+  document.body.classList.remove('studyroom-open');
+  srExitFullscreen();
+
+  if (studyroom.keyHandler) {
+    document.removeEventListener('keydown', studyroom.keyHandler, true);
+    studyroom.keyHandler = null;
+  }
+  if (studyroom.fsHandler) {
+    document.removeEventListener('fullscreenchange', studyroom.fsHandler);
+    document.removeEventListener('webkitfullscreenchange', studyroom.fsHandler);
+    studyroom.fsHandler = null;
+  }
+
+  // 还原滚动位置与焦点，页面布局不重建、Tab / 计时 / 悬浮球状态都保留
+  try { window.scrollTo({ top: studyroom.prevScroll, behavior: 'auto' }); }
+  catch (e) { window.scrollTo(0, studyroom.prevScroll); }
+  const btn = $('studyroom-btn');
+  if (btn && btn.focus) {
+    try { btn.focus({ preventScroll: true }); } catch (e) { /* 老浏览器忽略 */ }
+  }
+}
+
+function initStudyroom() {
+  const btn = $('studyroom-btn');
+  const layer = $('studyroom');
+  const exitBtn = $('sr-exit');
+  if (btn) btn.addEventListener('click', enterStudyroom);
+  if (exitBtn) exitBtn.addEventListener('click', exitStudyroom);
+  if (layer) {
+    layer.addEventListener('click', e => {
+      // 点空白区域也退出（点文字/时钟不退出，避免误触）
+      if (e.target === layer) exitStudyroom();
+    });
+  }
+}
+
+window.studyhubStudyroom = { enter: enterStudyroom, exit: exitStudyroom, isOpen: () => studyroom.open };
+
+
 /* ===== 每秒实时刷新（不重建 DOM，避免打断输入） ===== */
 function liveUpdate() {
   document.querySelectorAll('[data-cd]').forEach(el => { el.textContent = cdText(state.exams[el.dataset.cd]); });
@@ -2265,6 +2841,18 @@ function liveUpdate() {
   });
   const study = $('d-study');
   if (study) study.textContent = durText(todayStudySec());
+
+  // 小盆栽：专注时长跨过阶段阈值时才更新，避免每秒重排
+  if (plantLastStage !== null) {
+    const m = plantMinutes();
+    const s = plantStageOf(m);
+    if (s !== plantLastStage || m !== plantLastMinutes) renderPlant();
+  }
+
+  // 微习惯跨天检测：过了零点把勾选恢复成未完成
+  habitsTick();
+  // 顶栏倒计时：数字宽度每秒变化，顺手校正一次位置
+  cdSyncOffset();
 
   // 跨天：自动切到今天并高亮
   const now = todayStr();
@@ -2404,7 +2992,19 @@ $('tabs').addEventListener('click', e => {
 
 function switchTab() {
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === state.ui.tab));
-  document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + state.ui.tab));
+  // 先彻底摘掉所有页面的 active，再只给目标页加上——保证任何情况下都只有一个页面可见
+  const pages = document.querySelectorAll('.page');
+  pages.forEach(p => p.classList.remove('active'));
+  const target = document.getElementById('page-' + state.ui.tab);
+  if (target) {
+    target.classList.add('active');
+  } else if (pages.length) {
+    // 兜底：存档里的 tab 对不上任何页面时，回到仪表盘，避免出现“所有页面都隐藏”的白屏
+    state.ui.tab = 'dash';
+    const dash = document.getElementById('page-dash');
+    if (dash) dash.classList.add('active');
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'dash'));
+  }
   const hash = '#' + state.ui.tab;
   if (location.hash !== hash) {
     try { history.replaceState(null, '', hash); } catch (e) { /* file:// 下可能被限制 */ }
@@ -2424,6 +3024,7 @@ function renderActiveTab() {
     renderFitness();
   } else if (state.ui.tab === 'mood') {
     loadMoods();
+    capsuleRender(); // 切回来时按当前系统日期重新判断哪些信已解锁
   } else if (state.ui.tab === 'stats') {
     renderStats();
   } else if (state.ui.tab === 'plans') {
@@ -2839,56 +3440,1564 @@ $('week-grid').addEventListener('click', e => {
   }
 });
 
-/* ===== 白噪音 ===== */
-(function initNoise() {
-  const audio = $('noise-audio');
-  const hint = $('noise-hint');
-  const buttons = Array.from(document.querySelectorAll('.noise-btn'));
-  if (!audio || !buttons.length) return;
+/* ===== 赛博木鱼（Web Audio 合成音效 + localStorage 计数，无外部音频） ===== */
+const WF_KEY = 'studyhub.woodfish';
+let wfCtx = null;
 
-  let current = null;
-  const setHint = text => { if (hint) hint.textContent = text || ''; };
-  const markActive = btn => {
-    buttons.forEach(b => {
-      const on = b === btn;
-      b.classList.toggle('active', on);
-      b.setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
-  };
-  const stopNoise = () => {
-    audio.pause();
-    current = null;
-    markActive(null);
-    setHint('');
-  };
-  const playNoise = btn => {
-    if (current === btn && !audio.paused) { stopNoise(); return; }
-    const src = btn.dataset.src;
-    if (!src) return;
-    if (audio.getAttribute('src') !== src) audio.src = src;
-    audio.volume = 0.45;
-    const playing = audio.play();
-    if (playing && playing.catch) {
-      playing.catch(err => {
-        if (current !== btn) return;
-        console.warn('[noise] play failed', err);
-        setHint('音频加载失败，请检查网络或替换 data-src 链接');
-        current = null;
-        markActive(null);
-      });
+// { date: 'YYYY-MM-DD', today: n, total: n }；跨天时 today 归零、total 累加保留
+function wfRead() {
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(WF_KEY) || 'null'); } catch (e) { raw = null; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+  const today = todayStr();
+  const total = Math.max(0, Math.floor(Number(raw.total) || 0));
+  if (raw.date !== today) return { date: today, today: 0, total };
+  return { date: today, today: Math.max(0, Math.floor(Number(raw.today) || 0)), total };
+}
+
+function wfWrite(rec) {
+  try { localStorage.setItem(WF_KEY, JSON.stringify(rec)); } catch (e) { /* 隐私模式忽略 */ }
+}
+
+// 木鱼音色：短促的低频"咚" + 木头高频"嗒"，两层一起衰减
+function wfPlayTok() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!wfCtx) wfCtx = new AC();
+    if (wfCtx.state === 'suspended') wfCtx.resume().catch(() => {});
+    const ctx = wfCtx;
+    const t0 = ctx.currentTime;
+
+    // ① 木腔共鸣：三角波从 260Hz 快速滑到 110Hz，150ms 内衰减
+    const body = ctx.createOscillator();
+    const bodyGain = ctx.createGain();
+    body.type = 'triangle';
+    body.frequency.setValueAtTime(260, t0);
+    body.frequency.exponentialRampToValueAtTime(110, t0 + 0.12);
+    bodyGain.gain.setValueAtTime(0.0001, t0);
+    bodyGain.gain.exponentialRampToValueAtTime(0.26, t0 + 0.006);
+    bodyGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
+    body.connect(bodyGain).connect(ctx.destination);
+    body.start(t0);
+    body.stop(t0 + 0.24);
+
+    // ② 敲击脆响：带通白噪声，模拟木头撞击的"嗒"
+    const dur = 0.06;
+    const buffer = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * dur), ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const decay = Math.pow(1 - i / data.length, 3);
+      data[i] = (Math.random() * 2 - 1) * decay;
     }
-    current = btn;
-    markActive(btn);
-    setHint(`正在播放：${btn.dataset.name || ''}`);
-  };
-  buttons.forEach(btn => btn.addEventListener('click', () => playNoise(btn)));
-  audio.addEventListener('error', () => {
-    if (!current) return;
-    setHint('音频加载失败，请检查网络或替换 data-src 链接');
-    current = null;
-    markActive(null);
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.frequency.setValueAtTime(1800, t0);
+    band.Q.value = 1.6;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.32, t0);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    noise.connect(band).connect(noiseGain).connect(ctx.destination);
+    noise.start(t0);
+    noise.stop(t0 + dur);
+  } catch (e) {
+    console.warn('[woodfish] 音效播放失败', e);
+  }
+}
+
+// 敲击动画：加类名触发缩放，动画结束自动移除，连续点也能重放
+function wfPress() {
+  const icon = document.querySelector('#woodfish .wf-body');
+  if (!icon) return;
+  icon.classList.remove('is-hitting');
+  // 强制回流，保证连续点击时动画能重新触发
+  void icon.offsetWidth;
+  icon.classList.add('is-hitting');
+}
+
+// 功德气泡：在木鱼上方随机横向位置飘起并 1 秒内渐隐
+function wfBubble(text) {
+  const box = $('wf-bubbles');
+  if (!box) return;
+  const span = document.createElement('span');
+  span.className = 'wf-bubble';
+  span.textContent = text;
+  span.style.left = (28 + Math.round(Math.random() * 44)) + '%';
+  span.style.setProperty('--drift', (Math.random() * 28 - 14).toFixed(1) + 'px');
+  box.appendChild(span);
+  span.addEventListener('animationend', () => {
+    if (span.parentNode) span.parentNode.removeChild(span);
   });
+  // 兜底清理，避免动画事件被浏览器丢掉后气泡堆积
+  setTimeout(() => { if (span.parentNode) span.parentNode.removeChild(span); }, 1400);
+}
+
+function wfRefresh() {
+  const rec = wfRead();
+  const todayEl = $('wf-today');
+  if (todayEl) todayEl.textContent = rec.today > 0 ? `今日 ${rec.today}` : '';
+  const tip = $('woodfish-tip');
+  if (tip) tip.textContent = `今日功德 ${rec.today} · 累计 ${rec.total}`;
+  const box = $('woodfish');
+  if (box) box.setAttribute('aria-label', `赛博木鱼：今日功德 ${rec.today}，累计 ${rec.total}。点击敲击`);
+  return rec;
+}
+
+function wfHit() {
+  const rec = wfRead();
+  rec.today += 1;
+  rec.total += 1;
+  wfWrite(rec);
+  wfRefresh();
+  wfPlayTok();
+  wfPress();
+  wfBubble('功德 +1');
+}
+
+function initWoodfish() {
+  const box = $('woodfish');
+  if (!box) return;
+  box.addEventListener('click', e => {
+    e.preventDefault();
+    wfHit();
+  });
+  // 键盘可敲：Enter / 空格
+  box.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    e.preventDefault();
+    if (e.repeat) return; // 长按不连发，避免爆数据
+    wfHit();
+  });
+  // 每次悬浮时重新读一次，跨天后 tooltip 立即变回 0
+  box.addEventListener('mouseenter', wfRefresh);
+  box.addEventListener('focus', wfRefresh);
+  wfRefresh();
+}
+
+window.studyhubWoodfish = {
+  hit: wfHit,
+  stats: wfRead,
+  reset: () => { wfWrite({ date: todayStr(), today: 0, total: 0 }); wfRefresh(); }
+};
+
+
+/* ===== 每日一签（localStorage 按日期记录，当天只弹一次） ===== */
+const FORTUNE_KEY = 'studyhub.dailyFortune';
+const FORTUNE_DELAY = 2000;
+const FORTUNE_TUBE_ICON = '🎋';
+
+const FORTUNES = [
+  { level: '上上签', line: '今日宜：狂刷行测；忌：自我内耗。', sub: '稳住节奏，一天一天都是上岸的路。' },
+  { level: '上上签', line: '今日宜：背二十个单词；忌：熬夜刷手机到凌晨。', sub: '四级不过如此，坚持才是一切。' },
+  { level: '上上签', line: '今日宜：早睡一小时；忌：说“明天再开始”。', sub: '早睡是最便宜的记忆增强药。' },
+  { level: '上上签', line: '今日宜：一鼓作气做完套卷；忌：写一行刷十分钟手机。', sub: '专注 25 分钟，胜过稀里糊涂 2 小时。' },
+  { level: '上上签', line: '今日宜：把错题重新看一遍；忌：收藏了就等于学会了。', sub: '错过的题，才是真正的提分点。' },
+  { level: '上上签', line: '今日宜：给爸妈打个电话；忌：一个人闷头硬撑。', sub: '你不是一个人在战斗。' },
+  { level: '上上签', line: '今日宜：整理课表排好复习节奏；忌：随缘复习，见招拆招。', sub: '计划写下来，就成功了一半。' },
+  { level: '上上签', line: '今日宜：认真吃早饭；忌：靠咖啡续命一整天。', sub: '胃舒服了，脑子才转得动。' },
+  { level: '上上签', line: '今日宜：刷完一套资料分析；忌：焦虑排名而原地转圈。', sub: '行测是熟练度游戏，题感会来。' },
+  { level: '上上签', line: '今日宜：晚上复盘今日进度；忌：无脑熬夜感动自己。', sub: '有效的努力，才值得被记录。' },
+  { level: '上上签', line: '今日宜：把大目标拆成三件小事；忌：盯着终点吓自己。', sub: '一天做三件小事，一个学期就是大改变。' },
+  { level: '上上签', line: '今日宜：离开座位走走、喝口水；忌：一坐就是一下午。', sub: '身体是所有努力的本钱。' },
+  { level: '上上签', line: '今日宜：找一道难题问老师；忌：死磕到心态爆炸。', sub: '求助不是认输，是高效。' },
+  { level: '上上签', line: '今日宜：和室友去吃顿好的；忌：边吃边卷自己。', sub: '开心一点，效率会回报你。' },
+  { level: '上上签', line: '今日宜：对着镜子说一句“我可以”；忌：自我贬低。', sub: '你比想象中更有韧性。' },
+  { level: '上上签', line: '今日宜：复习一遍昨天学的；忌：学了后面忘了前面。', sub: '艾宾浩斯曲线是你的朋友。' }
+];
+
+function fortunePick() {
+  const saved = fortuneRead();
+  // 已经抽过就沿用当天那一条，保证“同一天刷新看到的是同一支签”
+  if (saved && saved.text) {
+    const hit = FORTUNES.find(f => f.line === saved.text);
+    if (hit) return hit;
+    return { level: saved.level || '上上签', line: saved.text, sub: saved.sub || '' };
+  }
+  return FORTUNES[Math.floor(Math.random() * FORTUNES.length)];
+}
+
+function fortuneRead() {
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(FORTUNE_KEY) || 'null'); } catch (e) { raw = null; }
+  if (!raw || typeof raw !== 'object') return null;
+  return raw.date === todayStr() ? raw : null;
+}
+
+function fortuneWrite(data) {
+  try { localStorage.setItem(FORTUNE_KEY, JSON.stringify(data)); } catch (e) { /* 隐私模式忽略 */ }
+}
+
+function setFortuneDrawn(drawn) {
+  const tube = $('fortune-tube');
+  const paper = $('fortune-paper');
+  const take = $('fortune-take');
+  const tip = $('fortune-tip');
+  if (tube) tube.classList.toggle('is-drawn', !!drawn);
+  if (paper) paper.classList.toggle('hidden', !drawn);
+  if (take) take.disabled = !drawn;
+  if (tip) tip.textContent = drawn ? '这支签，今天属于你 🌿' : '诚心默念今日的小目标，再敲一敲签筒';
+}
+
+function renderFortune(f) {
+  const line = $('fortune-line');
+  const sub = $('fortune-sub');
+  const title = $('fortune-title');
+  if (title) title.textContent = `今日一签 · ${f.level || '上上签'}`;
+  if (line) line.textContent = f.line;
+  if (sub) sub.textContent = f.sub || '';
+  setFortuneDrawn(true);
+}
+
+function drawFortune() {
+  const tube = $('fortune-tube');
+  if (!tube || tube.classList.contains('is-drawn')) return;
+  tube.classList.remove('is-shaking');
+  void tube.offsetWidth;
+  tube.classList.add('is-shaking');
+
+  const f = fortunePick();
+  fortuneWrite({
+    date: todayStr(),
+    at: new Date().toISOString(),
+    level: f.level,
+    text: f.line,
+    sub: f.sub,
+    drawn: true,
+    taken: false
+  });
+  // 摇一摇再揭签，节奏更顺
+  setTimeout(() => renderFortune(f), 420);
+}
+
+function closeFortune() {
+  const modal = $('fortune-modal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  modal.classList.add('hidden');
+  const msg = $('fortune-msg');
+  if (msg) msg.textContent = '';
+}
+
+function takeFortune() {
+  const modal = $('fortune-modal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  const saved = fortuneRead();
+  if (!saved || !saved.text) return; // 还没抽，按钮也是 disabled
+  fortuneWrite(Object.assign({}, saved, { taken: true }));
+  closeFortune();
+  syncToast('签文已收下，今天也要加油哦 🌿');
+}
+
+function showFortuneModalIfNeeded(delay) {
+  const modal = $('fortune-modal');
+  if (!modal) return;
+  const saved = fortuneRead();
+  if (saved && saved.taken) return; // 今天已经收下签文，不再弹
+
+  // 干扰弹窗：登录框 / 头像提示 / 倒计时新增 / 习惯确认 / 沉浸自习室 都别抢焦点
+  const busy = ['auth-modal', 'avatar-alert', 'cd-modal', 'habit-alert']
+    .some(id => { const el = $(id); return el && !el.classList.contains('hidden'); });
+  if (busy || document.documentElement.classList.contains('studyroom-open')) return;
+
+  modal.dataset.timer = String(setTimeout(() => {
+    if (!fortuneRead()) {
+      // 今天还没抽过：签筒待命
+      setFortuneDrawn(false);
+      const line = $('fortune-line');
+      const sub = $('fortune-sub');
+      if (line) line.textContent = '—';
+      if (sub) sub.textContent = '—';
+      const title = $('fortune-title');
+      if (title) title.textContent = '今日一签';
+    } else {
+      renderFortune(fortunePick());
+    }
+    modal.classList.remove('hidden');
+  }, delay || FORTUNE_DELAY));
+}
+
+function initFortune() {
+  const modal = $('fortune-modal');
+  const tube = $('fortune-tube');
+  const take = $('fortune-take');
+  const close = $('fortune-close');
+  if (!modal) return;
+  if (tube) tube.addEventListener('click', drawFortune);
+  if (take) take.addEventListener('click', takeFortune);
+  if (close) close.addEventListener('click', closeFortune);
+  modal.addEventListener('click', e => {
+    // 遮罩空白处点击：抽过签就当“收下”，没抽过就当稍后再看
+    if (e.target !== modal) return;
+    if (fortuneRead() && fortuneRead().text) takeFortune();
+    else closeFortune();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (modal.classList.contains('hidden')) return;
+    closeFortune();
+  });
+  showFortuneModalIfNeeded(FORTUNE_DELAY);
+}
+
+/* ===== 久坐 / 喝水提醒（45 分钟一次，纯前端定时器） ===== */
+const HYDRATE_KEY = 'studyhub.hydrateReminder';
+const HYDRATE_INTERVAL = 45 * 60 * 1000;   // 45 分钟
+const HYDRATE_TEXT = '该起来接杯水啦，顺便伸个懒腰吧！💧';
+const HYDRATE_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' +
+  '<path d="M12 2.6c-.35 0-.65.16-.86.42L5.2 10.6A8.3 8.3 0 0 0 3.7 15.2c0 4.6 3.7 8.2 8.3 8.2s8.3-3.6 8.3-8.2' +
+  'c0-1.8-.6-3.4-1.5-4.6l-5.94-7.58A1.1 1.1 0 0 0 12 2.6Z" fill="currentColor"/></svg>';
+
+const hydrate = { timer: 0, startedAt: 0, nextAt: 0, resting: true };   // resting=true 表示还没开启
+
+function hydrateOn() {
+  let raw = null;
+  try { raw = localStorage.getItem(HYDRATE_KEY); } catch (e) { raw = null; }
+  return raw === '1';
+}
+
+function hydrateWrite(on) {
+  try {
+    if (on) localStorage.setItem(HYDRATE_KEY, '1');
+    else localStorage.removeItem(HYDRATE_KEY);
+  } catch (e) { /* 隐私模式忽略 */ }
+}
+
+function hydrateSyncUI() {
+  const fab = $('hydrate-fab');
+  if (!fab) return;
+  const on = !hydrate.resting;   // 唯一权威状态：resting=false 即提醒进行中
+  fab.classList.toggle('is-on', on);
+  fab.setAttribute('aria-pressed', on ? 'true' : 'false');
+  fab.setAttribute('aria-label', on ? '喝水提醒：已开启，点击关闭' : '喝水提醒：未开启，点击开启');
+  const tip = $('hydrate-tip');
+  if (tip) {
+    tip.innerHTML = on
+      ? `喝水提醒已开启<br>每 ${HYDRATE_INTERVAL / 60000} 分钟提醒一次 · 点击关闭`
+      : `喝水提醒：未开启<br>点击开启 · 每 ${HYDRATE_INTERVAL / 60000} 分钟提醒一次`;
+  }
+}
+
+// 极短提示音：两下轻柔的马林巴式音符（正弦波 + 快速衰减），复用现有 AudioContext 思路但独立生成
+let hydrateCtx = null;
+function hydrateChime() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!hydrateCtx) hydrateCtx = new AC();
+    if (hydrateCtx.state === 'suspended') hydrateCtx.resume().catch(() => {});
+    const ctx = hydrateCtx;
+    const t0 = ctx.currentTime;
+    [880, 1318.5].forEach((freq, i) => {
+      const start = t0 + i * 0.16;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.12, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.55);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.6);
+    });
+  } catch (e) {
+    console.warn('[hydrate] 提示音播放失败', e);
+  }
+}
+
+function hydrateFire() {
+  hydrate.nextAt = Date.now() + HYDRATE_INTERVAL;
+  cornerToast(HYDRATE_TEXT, 6000);
+  hydrateChime();
+}
+
+function hydrateSchedule() {
+  clearTimeout(hydrate.timer);
+  hydrate.timer = 0;
+  hydrate.startedAt = Date.now();
+  hydrate.nextAt = hydrate.startedAt + HYDRATE_INTERVAL;
+  // 用 setTimeout 链式续期而不是 setInterval：每次触发后重新计时，页面休眠后也不会“补弹”
+  const loop = () => {
+    hydrate.timer = 0;                  // 定时器已经触发，先清掉句柄，避免残留 id 干扰判断
+    if (hydrate.resting) return;        // 已点关闭：不再续期
+    hydrateFire();
+    hydrate.timer = setTimeout(loop, HYDRATE_INTERVAL);
+  };
+  hydrate.timer = setTimeout(loop, HYDRATE_INTERVAL);
+}
+
+function hydrateStop() {
+  clearTimeout(hydrate.timer);
+  hydrate.timer = 0;
+  hydrate.nextAt = 0;
+}
+
+// 关闭判定只看“是否处于休息态”，不依赖 timer 句柄——回调触发后的瞬间 timer 可能为 0
+function hydrateToggle() {
+  if (!hydrate.resting) {
+    hydrate.resting = true;   // 先置休息态，避免同时在跑的 loop 立刻又复排定时器
+    hydrateStop();
+    hydrateWrite(false);
+    hydrateSyncUI();
+    syncToast('已关闭喝水提醒，记得自己也要多喝水哦 💧');
+    return;
+  }
+  hydrate.resting = false;
+  hydrateSchedule();
+  hydrateWrite(true);
+  hydrateSyncUI();
+  syncToast(`喝水提醒已开启，${HYDRATE_INTERVAL / 60000} 分钟后提醒你一次 💧`);
+}
+
+function initHydrate() {
+  const fab = $('hydrate-fab');
+  if (!fab) return;
+  fab.addEventListener('click', () => hydrateToggle());
+  fab.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    e.preventDefault();
+    if (e.repeat) return;
+    hydrateToggle();
+  });
+  // 上次开着提醒的，刷新后自动续上（不跨会话计算剩余时间，重新从 45 分钟开始）
+  if (hydrateOn()) { hydrate.resting = false; hydrateSchedule(); }
+  else hydrate.resting = true;
+  hydrateSyncUI();
+}
+
+window.studyhubWellness = {
+  fortune: { open: () => showFortuneModalIfNeeded(0), close: closeFortune, data: fortuneRead },
+  hydrate: {
+    toggle: hydrateToggle,
+    isOn: () => !hydrate.resting,
+    nextAt: () => hydrate.nextAt
+  }
+};
+
+
+/* ===== 全局粒子特效（纯代码，requestAnimationFrame，同屏 ≤ 20 个） =====
+   只在私有数组里算坐标，直接写 element.style，不读布局；
+   生命周期结束立刻从 DOM 与数组移除；指针事件整层穿透，不影响任何交互。 ===== */
+const FX_KEY = 'studyhub.particles';
+const FX_MAX = 20;             // 同屏粒子硬上限
+const FX_TRAIL_GAP = 110;      // 两个拖尾粒子之间的最小距离（px）
+const FX_TRAIL_COOLDOWN = 55;  // 连续移动时的最小发射间隔（ms）
+
+const fx = {
+  on: true,
+  layer: null,
+  parts: [],
+  raf: 0,
+  last: 0,
+  lastEmit: 0,
+  lastX: 0,
+  lastY: 0,
+  moved: false
+};
+
+function fxEnabled() {
+  let raw = null;
+  try { raw = localStorage.getItem(FX_KEY); } catch (e) { raw = null; }
+  return raw !== '0';           // 默认开启
+}
+
+function fxPersist(on) {
+  try {
+    if (on) localStorage.removeItem(FX_KEY);   // 默认就是开，不需要存
+    else localStorage.setItem(FX_KEY, '0');
+  } catch (e) { /* 隐私模式忽略 */ }
+}
+
+// 指针是否落在页面“空白处”：排除表单、按钮、可交互悬浮球与弹窗内容
+function fxOnBlankTarget(el) {
+  if (!el || !el.closest) return true;
+  return !el.closest('input, textarea, select, button, a, label, summary, [contenteditable="true"], ' +
+    '.woodfish, .hydrate-fab, .noise-fab, .fx-toggle, .auth-card, .studyroom');
+}
+
+function fxSyncToggle() {
+  const btn = $('fx-toggle');
+  if (btn) {
+    btn.classList.toggle('is-off', !fx.on);
+    btn.setAttribute('aria-pressed', fx.on ? 'true' : 'false');
+    btn.title = fx.on ? '关闭粒子特效' : '开启粒子特效';
+    btn.setAttribute('aria-label', btn.title);
+  }
+  const layer = fx.layer || $('fx-layer');
+  if (layer) layer.classList.toggle('is-off', !fx.on);
+}
+
+// 取顶层保留：不支持时就跳过该粒子
+function fxCanvasPos(x, y) {
+  let cx = x, cy = y;
+  if (typeof document.elementFromPoint === 'function') {
+    try {
+      const top = document.elementFromPoint(x, y);
+      if (top && (top.id === 'fx-layer' || (top.closest && top.closest('.fx-layer')))) {
+        cx = x + 1;
+        cy = y + 1;
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  return { x: cx, y: cy };
+}
+
+function fxSpawn(o) {
+  if (!fx.on || !fx.layer) return null;
+  if (fx.parts.length >= FX_MAX) return null;
+  if (document.hidden) return null;
+
+  const el = document.createElement('span');
+  el.className = 'fx-p' + (o.burst ? ' is-burst' : '');
+  el.style.setProperty('--s', o.size.toFixed(1) + 'px');
+  el.style.setProperty('--c', o.color);
+  el.style.setProperty('--a', o.alpha.toFixed(2));
+  el.style.opacity = '0';
+  fx.layer.appendChild(el);
+
+  const p = {
+    el,
+    x: o.x, y: o.y,
+    vx: o.vx || 0, vy: o.vy || 0,
+    life: 0,
+    max: o.life,
+    size: o.size,
+    base: o.size,          // 初始尺寸，缩放比例以它为分母
+    rot: Math.random() * 360
+  };
+  fx.parts.push(p);
+  fxStart();
+  return p;
+}
+
+function fxTrail(x, y) {
+  const burst = false;
+  const dark = document.documentElement.classList.contains('dark');
+  const color = Math.random() < 0.5 ? 'var(--particle-a)' : 'var(--particle-b)';
+  fxSpawn({
+    x, y,
+    size: 7 + Math.random() * 9,               // 7 ~ 16px 的微弱光点
+    life: 480 + Math.random() * 360,           // 0.5 ~ 0.85s 后消失
+    vx: (Math.random() - 0.5) * 22,
+    vy: -8 - Math.random() * 14,               // 轻微上浮
+    alpha: dark ? 0.55 : 0.45,
+    color,
+    burst
+  });
+}
+
+function fxBurst(x, y, count) {
+  const n = count || (3 + Math.floor(Math.random() * 3));   // 3 ~ 5 个
+  const dark = document.documentElement.classList.contains('dark');
+  for (let i = 0; i < n; i++) {
+    const angle = (Math.PI * 2 * i) / n + Math.random() * 0.5;
+    const speed = 60 + Math.random() * 70;
+    fxSpawn({
+      x, y,
+      size: 6 + Math.random() * 8,
+      life: 420 + Math.random() * 220,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 20,
+      alpha: dark ? 0.9 : 0.8,
+      color: Math.random() < 0.65 ? 'var(--particle-b)' : 'var(--particle-a)',
+      burst: true
+    });
+  }
+}
+
+// 单个 rAF 循环驱动全部粒子：指数衰减 + 抛物线般的轻微重力
+function fxFrame(now) {
+  fx.raf = 0;
+  if (!fx.on || !fx.parts.length) { fx.parts = []; return; }
+  const dt = Math.min(48, (now - (fx.last || now)) / 1000);   // 切页/休眠回来时钳住，避免瞬移
+  fx.last = now;
+  const damping = Math.pow(0.06, dt);                          // 每秒衰减到 6%
+  const keep = [];
+  for (const p of fx.parts) {
+    p.life += dt * 1000;
+    const k = p.life / p.max;
+    if (k >= 1) {
+      if (p.el.parentNode) p.el.parentNode.removeChild(p.el);    // 生命周期结束立刻移除
+      continue;
+    }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= damping;
+    p.vy = p.vy * damping + 26 * dt;                            // 轻微下落，像星尘散开
+    p.size *= Math.pow(0.55, dt);                               // 逐渐变小
+    const scale = Math.min(1, Math.max(0.12, p.size / p.base));
+    // 拖尾粒子：先淡入（前 12% 时间）再逐渐淡出
+    const fadeIn = k < 0.12 ? k / 0.12 : 1;
+    const fadeOut = 1 - k;
+    p.el.style.transform = `translate3d(${p.x.toFixed(1)}px, ${p.y.toFixed(1)}px, 0) scale(${scale.toFixed(2)}) rotate(${(p.rot * k).toFixed(0)}deg)`;
+    p.el.style.opacity = Math.max(0, Math.min(1, fadeIn * fadeOut)).toFixed(2);
+    keep.push(p);
+  }
+  fx.parts = keep;
+  if (keep.length) fx.raf = requestAnimationFrame(fxFrame);
+  else fx.last = 0;
+}
+
+function fxStart() {
+  if (fx.raf || !fx.parts.length) return;
+  fx.last = 0;
+  fx.raf = requestAnimationFrame(fxFrame);
+}
+
+function fxClearAll() {
+  if (fx.raf) { cancelAnimationFrame(fx.raf); fx.raf = 0; }
+  for (const p of fx.parts) {
+    if (p.el.parentNode) p.el.parentNode.removeChild(p.el);
+  }
+  fx.parts = [];
+  fx.last = 0;
+}
+
+function fxSetEnabled(on) {
+  fx.on = !!on;
+  fxPersist(fx.on);
+  if (!fx.on) fxClearAll();
+  fxSyncToggle();
+}
+
+/* ---- 事件：指针移动拖尾 ---- */
+document.addEventListener('pointermove', e => {
+  if (!fx.on || !e.isPrimary) return;
+  if (e.pointerType === 'mouse' && e.buttons) return;   // 拖动/选中时不放粒子
+  if (!fxOnBlankTarget(e.target)) return;
+  const now = performance.now();
+  const dx = e.clientX - fx.lastX;
+  const dy = e.clientY - fx.lastY;
+  const first = !fx.moved;
+  fx.lastX = e.clientX;
+  fx.lastY = e.clientY;
+  fx.moved = true;
+  if (first) { fx.lastEmit = 0; return; }               // 第一次移动只记坐标，立刻允许下一个点发射
+  if (now - fx.lastEmit < FX_TRAIL_COOLDOWN) return;
+  if (dx * dx + dy * dy < FX_TRAIL_GAP * FX_TRAIL_GAP) return;
+  fx.lastEmit = now;
+  const pos = fxCanvasPos(e.clientX, e.clientY);
+  fxTrail(pos.x, pos.y);
+}, { passive: true });
+
+/* ---- 事件：点击爆发（不吃掉原点击，冒泡后照常触发） ---- */
+document.addEventListener('click', e => {
+  if (!fx.on) return;
+  if (!fxOnBlankTarget(e.target)) return;               // 按钮等交互元素只响应自身，不额外放粒子
+  const pos = fxCanvasPos(e.clientX, e.clientY);
+  fxBurst(pos.x, pos.y);
+});
+
+/* ---- 事件：重新回到页面时清空残留 ---- */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) fxClearAll();
+});
+
+function initFx() {
+  fx.layer = $('fx-layer');
+  if (!fx.layer) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    fx.on = false;            // 系统要求减少动效时默认关闭
+  } else {
+    fx.on = fxEnabled();
+  }
+  const btn = $('fx-toggle');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      fxSetEnabled(!fx.on);
+      syncToast(fx.on ? '粒子特效已开启 ✨' : '粒子特效已关闭，省电模式 🌙');
+    });
+  }
+  fxSyncToggle();
+}
+
+window.studyhubFx = {
+  toggle: fxSetEnabled,
+  isOn: () => fx.on,
+  count: () => fx.parts.length,
+  burst: (x, y) => fxBurst(x, y),
+  clear: fxClearAll
+};
+
+
+/* ===== 白噪音 · 黑胶唱片混音器（三路独立音频实时混音） ===== */
+(function initNoise() {
+  const deck = $('vinyl-deck');
+  const mixer = $('mixer');
+  if (!deck || !mixer) return;
+
+  const hint = $('noise-hint');
+  const powerBtn = $('vinyl-power');
+  const disc = $('vinyl-disc');
+  const tonearm = $('vinyl-tonearm');
+  const sliders = Array.from(mixer.querySelectorAll('.mix-slider'));
+  const audios = Array.from(document.querySelectorAll('.mix-audio'));
+  const valEls = {
+    rain: $('mix-val-rain'),
+    cafe: $('mix-val-cafe'),
+    wave: $('mix-val-wave')
+  };
+  const NAMES = { rain: '雨声', cafe: '咖啡馆', wave: '海浪' };
+  const MAX_GAIN = 0.75;          // 单轨最大音量，避免三路叠加破音
+  const saved = {};               // 每轨用户设定的 0~1 音量
+  let paused = false;             // 用户按了暂停（滑杆值保留）
+  let lastError = '';
+
+  const audioOf = track => audios.find(a => a.dataset.track === track) || null;
+  sliders.forEach(s => { saved[s.parentNode.dataset.track] = 0; });
+
+  const setHint = text => { if (hint) hint.textContent = text || ''; };
+
+  // 是否有任何一路在真正出声
+  const anyAudible = () => Object.keys(saved).some(k => saved[k] > 0) && !paused;
+  const anyVolume = () => Object.keys(saved).some(k => saved[k] > 0);
+
+  // 唱片旋转 / 唱针起落：完全由 CSS 控制，这里只切 data 属性
+  function syncDeck(playing) {
+    deck.dataset.playing = playing ? 'true' : 'false';
+    if (powerBtn) {
+      powerBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
+      powerBtn.title = playing ? '暂停混音' : '播放混音';
+      powerBtn.setAttribute('aria-label', playing ? '暂停混音' : '播放混音');
+      const icon = powerBtn.querySelector('.vinyl-power-icon');
+      if (icon) icon.textContent = playing ? '❚❚' : '▶';
+    }
+    if (disc) disc.classList.toggle('is-spinning', playing);
+    if (tonearm) tonearm.classList.toggle('is-down', playing);
+  }
+
+  function stepVolume() {
+    audios.forEach(a => {
+      const t = a.dataset.track;
+      const v = (saved[t] || 0) * MAX_GAIN;
+      try { a.volume = Math.max(0, Math.min(1, v)); } catch (e) { /* 忽略 */ }
+    });
+  }
+
+  function pauseAll() {
+    audios.forEach(a => { try { a.pause(); } catch (e) { /* 忽略 */ } });
+    syncDeck(false);
+    if (anyVolume()) setHint('已暂停，点播放继续');
+    else setHint('拖动滑杆开始混音');
+  }
+
+  function playAll() {
+    let started = 0;
+    audios.forEach(a => {
+      const t = a.dataset.track;
+      if (!(saved[t] > 0)) { try { a.pause(); } catch (e) { /* 忽略 */ } return; }
+      // 第一次发声时才写入音源，避免面板一打开就下载三个 mp3
+      const row = mixer.querySelector('.mix-row[data-track="' + t + '"]');
+      const src = row && row.querySelector('.mix-slider').getAttribute('data-src');
+      if (src && a.getAttribute('src') !== src) a.src = src;
+      if (a.paused) {
+        const p = a.play();
+        if (p && p.catch) {
+          p.catch(err => {
+            const msg = String((err && err.message) || err);
+            if (!/interrupted|play\(\) request was interrupted/i.test(msg) && msg !== lastError) {
+              lastError = msg;
+              console.warn('[noise] play failed', err);
+              setHint('音频加载失败，请检查网络或替换 data-src 链接');
+            }
+          });
+        }
+      }
+      started++;
+    });
+    // 有任意一路在播放才让唱片转起来
+    if (started > 0 && !paused) {
+      syncDeck(true);
+      const names = Object.keys(saved).filter(k => saved[k] > 0).map(k => NAMES[k]).join(' + ');
+      setHint('正在混音：' + names);
+    } else {
+      syncDeck(false);
+      // 有音量但已暂停 / 目前没有任何一路在出声，分别提示
+      if (started === 0 && anyVolume()) setHint('已暂停，点播放继续');
+      else if (started === 0) setHint('拖动滑杆开始混音');
+    }
+  }
+
+  // 滑杆变化：实时改音量，按需起停
+  function onSlider(e) {
+    const input = e.target;
+    if (!input || !input.dataset || input.dataset.src === undefined) return;
+    const track = input.closest('.mix-row').dataset.track;
+    const val = Math.max(0, Math.min(100, Number(input.value) || 0));
+    saved[track] = val / 100;
+    if (valEls[track]) valEls[track].textContent = val + '%';
+    if (val > 0) paused = false;   // 任意滑杆被拉起来就视为想听
+    stepVolume();
+  }
+  // 有无可闻音量 → 唱片转不转，一处判断（滑杆归零时也会走到这里）
+  function syncAll() {
+    if (anyAudible()) playAll(); else pauseAll();
+  }
+  sliders.forEach(s => {
+    s.addEventListener('input', (e) => { onSlider(e); syncAll(); });
+    s.addEventListener('change', (e) => { onSlider(e); syncAll(); });
+  });
+
+  // 电源键：有三路音轨在响 → 全部暂停；否则按当前滑杆值恢复播放
+  if (powerBtn) {
+    powerBtn.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!anyVolume()) {
+        setHint('先把任意一个滑杆拉起来吧');
+        return;
+      }
+      paused = !paused;
+      if (paused) {
+        pauseAll();
+        setHint('已暂停，点播放继续');
+      } else {
+        playAll();
+      }
+    });
+  }
+
+  audios.forEach(a => {
+    a.addEventListener('error', () => {
+      setHint('音频加载失败，请检查网络或替换 data-src 链接');
+    });
+  });
+
+  syncDeck(false);
+  setHint('拖动滑杆开始混音');
+  window.studyhubNoise = {
+    volumes: () => Object.assign({}, saved),
+    play: () => { paused = false; playAll(); },
+    pause: () => { paused = true; pauseAll(); }
+  };
 })();
+
+
+/* ===== 桌面像素小盆栽（读取今日学习时长，纯展示，不写数据） ===== */
+const PLANT_STAGE_TEXT = {
+  0: { name: '枯草', tip: '今天还没开始专注呢，浇点学习时间吧 🌱' },
+  1: { name: '小芽', tip: '小盆栽长出了嫩芽，继续保持哦！' },
+  2: { name: '绿叶', tip: '绿叶茂盛起来啦，状态不错！' },
+  3: { name: '开花', tip: '今天专注超过 3 小时，开花了！🌸' }
+};
+let plantLastStage = null;    // 上次渲染的阶段，liveUpdate 用它判断是否需要重绘
+let plantLastMinutes = -1;
+
+// 0 枯草 / 1 小芽（<60 分钟）/ 2 绿叶（60~180 分钟）/ 3 开花（>180 分钟）
+function plantStageOf(minutes) {
+  if (!(minutes > 0)) return 0;
+  if (minutes < 60) return 1;
+  if (minutes <= 180) return 2;
+  return 3;
+}
+
+function plantMinutes() {
+  const sec = todayStudySec(todayStr());
+  return Math.max(0, Math.floor(sec / 60));
+}
+
+function renderPlant() {
+  const fab = $('plant-fab');
+  if (!fab) return;
+  const stageEl = fab.querySelector('.plant-stage');
+  const tip = $('plant-tip');
+  const minutes = plantMinutes();
+  const stage = plantStageOf(minutes);
+  plantLastStage = stage;
+  plantLastMinutes = minutes;
+  if (stageEl) stageEl.dataset.stage = String(stage);
+  fab.dataset.stage = String(stage);
+  fab.classList.toggle('is-wilted', stage === 0);
+
+  const tipText = `今日专注 ${minutes} 分钟，小盆栽正在努力生长哦！`;
+  if (tip) tip.textContent = tipText;
+  fab.setAttribute('aria-label', `今日专注 ${minutes} 分钟 · 小盆栽状态：${PLANT_STAGE_TEXT[stage].name}`);
+  // 悬浮提示里补一句状态说明，方便一眼看出成长阶段
+  if (tip) tip.dataset.stage = PLANT_STAGE_TEXT[stage].name;
+  return { minutes, stage };
+}
+
+function initPlant() {
+  const fab = $('plant-fab');
+  if (!fab) return;
+  renderPlant();
+  window.studyhubPlant = { render: renderPlant, stage: () => plantStageOf(plantMinutes()), minutes: plantMinutes };
+}
+
+/* ===== 桌面随意贴（云端 stickies 表，未登录时 localStorage 兜底） ===== */
+const STICKY_KEY = 'studyhub.stickyNotes';
+const STICKY_TINTS_KEY = 'studyhub.stickyTints';
+const STICKY_MAX = 30;
+const STICKY_TINTS = ['butter', 'mint', 'sky', 'peach'];
+const STICKY_SAVE_DELAY = 400;          // 拖动 / 输入统一防抖，避免频繁请求
+const stickyUi = { drag: null, saveTimer: 0 };
+const stickySync = { rows: [], loaded: false, loading: false, pending: new Map() };
+
+// tint（便签颜色）是纯视觉偏好，云端表里没有这一列，继续存本机
+function stickyTintsRead() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STICKY_TINTS_KEY) || '{}');
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function stickyTintSave(id, tint) {
+  if (!id || !tint) return;
+  const all = stickyTintsRead();
+  all[String(id)] = tint;
+  try { localStorage.setItem(STICKY_TINTS_KEY, JSON.stringify(all)); } catch (e) { /* 隐私模式忽略 */ }
+}
+
+function stickyNormalize(n) {
+  const tints = stickyTintsRead();
+  const stored = tints[String(n.id)];
+  return {
+    id: String(n.id),
+    text: String(n.text == null ? '' : n.text),
+    x: Math.max(0, Math.round(Number(n.x) || 0)),
+    y: Math.max(0, Math.round(Number(n.y) || 0)),
+    tint: STICKY_TINTS.includes(n.tint) ? n.tint : (STICKY_TINTS.includes(stored) ? stored : 'butter')
+  };
+}
+
+function stickyLocalRead() {
+  let raw = [];
+  try { raw = JSON.parse(localStorage.getItem(STICKY_KEY) || '[]'); } catch (e) { raw = []; }
+  return (Array.isArray(raw) ? raw : [])
+    .filter(n => n && typeof n === 'object' && n.id)
+    .map(stickyNormalize);
+}
+
+function stickyLocalWrite(list) {
+  try { localStorage.setItem(STICKY_KEY, JSON.stringify(list)); }
+  catch (e) { console.warn('[sticky] 本地保存失败', e); }
+}
+
+// 读：登录并拉取过就用云端缓存；否则用 localStorage
+function stickyRead() {
+  return stickySync.loaded ? stickySync.rows.slice() : stickyLocalRead();
+}
+
+function stickyClient() {
+  return cloud.client || window.studyhubClient || null;
+}
+
+function stickyRowToNote(r) {
+  return stickyNormalize({ id: r.id, text: r.content, x: r.pos_x, y: r.pos_y });
+}
+
+const STICKY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// 写：改内存（云端模式）或 localStorage（未登录模式）
+function stickyWrite(list) {
+  if (stickySync.loaded) stickySync.rows = list.slice();
+  else stickyLocalWrite(list);
+}
+
+function stickyQueueUpsert(note) {
+  stickySync.pending.set(String(note.id), { note: Object.assign({}, note), removed: false });
+  stickyFlushSoon();
+}
+
+function stickyQueueDelete(id) {
+  stickySync.pending.set(String(id), { removed: true });
+  stickyFlushSoon();
+}
+
+function stickyFlushSoon() {
+  clearTimeout(stickyUi.saveTimer);
+  stickyUi.saveTimer = setTimeout(stickyFlush, STICKY_SAVE_DELAY);
+}
+
+async function stickyFlush() {
+  clearTimeout(stickyUi.saveTimer);
+  stickyUi.saveTimer = 0;
+  if (!stickySync.pending.size) return;
+  const client = stickyClient();
+  if (!client) return;                       // 未登录：等登录后统一迁移
+  if (!cloud.user) await ensureCloudUser();
+  const uid = cloud.user && cloud.user.id;
+  if (!uid) return;
+
+  const batch = Array.from(stickySync.pending.entries());
+  stickySync.pending.clear();
+
+  for (const [id, op] of batch) {
+    try {
+      if (op.removed) {
+        if (!STICKY_UUID_RE.test(String(id))) continue;   // 本地临时 id 还没入库，直接丢弃
+        const { error } = await client.from('stickies').delete().eq('id', id).eq('user_id', uid);
+        if (error) throw error;
+        continue;
+      }
+      const note = op.note;
+      if (!STICKY_UUID_RE.test(String(note.id))) {
+        // 新便签：不带 id，让数据库生成 uuid
+        const { data, error } = await client.from('stickies')
+          .insert({ user_id: uid, content: note.text, pos_x: note.x, pos_y: note.y })
+          .select().single();
+        if (error) throw error;
+        if (data && data.id) {
+          stickySync.rows = stickySync.rows.map(n => (n.id === note.id ? Object.assign({}, n, { id: String(data.id) }) : n));
+          stickyTintSave(data.id, note.tint);
+          stickyRender();
+        }
+        continue;
+      }
+      const { error } = await client.from('stickies').upsert({
+        id: note.id, user_id: uid, content: note.text, pos_x: note.x, pos_y: note.y
+      }, { onConflict: 'id' });
+      if (error) throw error;
+      stickyTintSave(note.id, note.tint);
+      // 云端没有这一行时 upsert 会插入，这里缓存指向的仍是同一 id，无需换号
+    } catch (err) {
+      console.warn('[sticky] 云端保存失败', err);
+      stickySync.pending.set(id, op);       // 放回队列，稍后重试
+      syncError('便签同步失败：' + ((err && err.message) || '请检查网络或 RLS'));
+      break;
+    }
+  }
+  if (stickySync.pending.size) stickyFlushSoon();
+}
+
+// 登录后拉取：云端为空且本机有数据时，先把本机便签迁上去
+async function stickyPull() {
+  const client = stickyClient();
+  if (!client) return;
+  if (!cloud.user) await ensureCloudUser();
+  const uid = cloud.user && cloud.user.id;
+  if (!uid) return;
+  stickySync.loading = true;
+  try {
+    const { data, error } = await client.from('stickies')
+      .select('*').eq('user_id', uid).order('updated_at', { ascending: true });
+    if (error) throw error;
+    const rows = (Array.isArray(data) ? data : []).map(stickyRowToNote);
+    const local = stickyLocalRead();
+
+    if (!rows.length && local.length) {
+      for (const n of local) {
+        try {
+          const { data: saved, error: insErr } = await client.from('stickies')
+            .insert({ user_id: uid, content: n.text, pos_x: n.x, pos_y: n.y })
+            .select().single();
+          if (insErr) throw insErr;
+          if (saved && saved.id) {
+            stickyTintSave(saved.id, n.tint);
+            rows.push(stickyRowToNote(saved));
+          }
+        } catch (err) {
+          console.warn('[sticky] 迁移失败', err);
+        }
+      }
+      if (rows.length) syncToast('本机便签已迁移到云端 ☁️');
+    }
+
+    stickySync.rows = rows;
+    stickySync.loaded = true;
+    stickyRender();
+  } catch (err) {
+    console.warn('[sticky] 拉取失败，继续用本机数据', err);
+    const msg = String((err && err.message) || '');
+    if (/does not exist|schema cache/i.test(msg)) {
+      syncError('stickies 表还没建好：请先在 Supabase SQL Editor 执行便签建表 SQL');
+    } else {
+      syncError('便签读取失败：' + (msg || '请检查网络或 RLS'));
+    }
+  } finally {
+    stickySync.loading = false;
+  }
+}
+
+// 退出登录：回到本机模式
+function stickyResetLocal() {
+  stickySync.rows = [];
+  stickySync.loaded = false;
+  stickySync.pending.clear();
+  clearTimeout(stickyUi.saveTimer);
+  stickyUi.saveTimer = 0;
+  stickyRender();
+}
+
+function stickyField() {
+  return Math.max(240, document.documentElement.scrollWidth || window.innerWidth || 800);
+}
+
+// 让便签始终留在可视范围内
+function stickyClamp(x, y) {
+  const w = document.documentElement.clientWidth || window.innerWidth || 800;
+  const h = window.innerHeight || 600;
+  return {
+    x: Math.min(Math.max(8, Math.round(x)), Math.max(8, w - 200)),
+    y: Math.min(Math.max(8, Math.round(y)), Math.max(8, h - 120))
+  };
+}
+
+function stickyRender() {
+  const layer = $('sticky-layer');
+  if (!layer) return;
+  const notes = stickyRead();
+  layer.innerHTML = notes.map(n => `<div class="sticky-note tint-${esc(n.tint)}" data-note-id="${esc(n.id)}"
+      style="left:${n.x}px;top:${n.y}px" role="group" aria-label="便签">
+      <div class="sticky-bar" data-note-drag aria-label="拖动便签" title="拖动移动位置">
+        <span class="sticky-grip" aria-hidden="true">••••</span>
+      </div>
+      <button class="sticky-del" type="button" data-note-del="${esc(n.id)}" title="删除便签" aria-label="删除便签">×</button>
+      <textarea class="sticky-text" data-note-text="${esc(n.id)}" maxlength="500"
+        placeholder="写点什么…" aria-label="便签内容">${esc(n.text)}</textarea>
+    </div>`).join('');
+  stickyUi.notes = notes;
+}
+
+function stickyAdd(x, y) {
+  const notes = stickyRead();
+  if (notes.length >= STICKY_MAX) { syncToast(`最多只能贴 ${STICKY_MAX} 张便签哦`); return; }
+  const pos = stickyClamp(x, y);
+  const newId = (window.crypto && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID()               // 提前生成合法 uuid，离线也能保持 id 稳定
+    : uid();
+  const note = stickyNormalize({
+    id: newId, text: '', x: pos.x, y: pos.y,
+    tint: STICKY_TINTS[notes.length % STICKY_TINTS.length]
+  });
+  notes.push(note);
+  stickyWrite(notes);
+  stickyRender();
+  stickyQueueUpsert(note);              // 400ms 后写云端
+  const ta = document.querySelector('[data-note-text="' + note.id + '"]');
+  if (ta) {
+    try { ta.focus({ preventScroll: true }); } catch (e) { /* 忽略 */ }
+  }
+}
+
+function stickyUpdate(id, patch) {
+  const notes = stickyRead();
+  const hit = notes.find(n => n.id === String(id));
+  if (!hit) return;
+  Object.assign(hit, patch);
+  stickyWrite(notes);
+  stickyQueueUpsert(hit);               // 输入 / 拖动都走 400ms 防抖
+}
+
+function stickyDelete(id) {
+  const notes = stickyRead().filter(n => n.id !== String(id));
+  stickyWrite(notes);
+  stickyRender();
+  stickyQueueDelete(id);
+}
+
+// 双击生成便签：排除输入框、按钮、以及已有的便签内部
+function stickyOnBlank(target) {
+  if (!target || !target.closest) return true;
+  return !target.closest('input, textarea, select, button, a, label, summary, [contenteditable="true"], ' +
+    '.sticky-note, .auth-card, .auth-modal, .studyroom, .woodfish, .hydrate-fab, .plant-fab, .noise-fab, .fx-toggle');
+}
+
+function initSticky() {
+  const layer = $('sticky-layer');
+  if (!layer) return;
+  stickyRender();
+
+  document.addEventListener('dblclick', e => {
+    if (!stickyOnBlank(e.target)) return;
+    if (document.documentElement.classList.contains('studyroom-open')) return;
+    // 双击选中的文字不生成便签
+    const sel = window.getSelection && window.getSelection();
+    if (sel && String(sel).trim()) return;
+    e.preventDefault();
+    stickyAdd(e.clientX - 80, e.clientY - 18);
+  });
+
+  // 输入：防抖 400ms 保存（不重建 DOM，避免打断打字）
+  layer.addEventListener('input', e => {
+    const ta = e.target.closest('.sticky-text');
+    if (!ta) return;
+    const id = ta.dataset.noteText;
+    const val = ta.value;
+    clearTimeout(stickyUi.saveTimer);
+    stickyUi.saveTimer = setTimeout(() => stickyUpdate(id, { text: val }), STICKY_SAVE_DELAY);
+  });
+  // 失焦立刻保存
+  layer.addEventListener('focusout', e => {
+    const ta = e.target.closest('.sticky-text');
+    if (!ta) return;
+    clearTimeout(stickyUi.saveTimer);
+    stickyUpdate(ta.dataset.noteText, { text: ta.value });
+  });
+  layer.addEventListener('click', e => {
+    const del = e.target.closest('[data-note-del]');
+    if (del) {
+      e.stopPropagation();
+      stickyDelete(del.dataset.noteDel);
+    }
+  });
+
+  // 拖拽：按住顶部小条移动，松手写回坐标（写回同样走 400ms 防抖的 stickyUpdate）
+  layer.addEventListener('pointerdown', e => {
+    const bar = e.target.closest('[data-note-drag]');
+    if (!bar) return;
+    const note = bar.closest('.sticky-note');
+    if (!note) return;
+    e.preventDefault();
+    stickyUi.drag = {
+      el: note,
+      id: note.dataset.noteId,
+      startX: e.clientX,
+      startY: e.clientY,
+      originX: parseFloat(note.style.left) || 0,
+      originY: parseFloat(note.style.top) || 0
+    };
+    note.classList.add('is-dragging');
+    try { bar.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+  });
+  // 拖动中每 400ms 最多提交一次坐标（长距离慢拖也能上云，不用等松手）
+  layer.addEventListener('pointermove', e => {
+    const d = stickyUi.drag;
+    if (!d) return;
+    const pos = stickyClamp(d.originX + (e.clientX - d.startX), d.originY + (e.clientY - d.startY));
+    d.el.style.left = pos.x + 'px';
+    d.el.style.top = pos.y + 'px';
+    d.pos = pos;
+    if (!d.lastSave || Date.now() - d.lastSave > STICKY_SAVE_DELAY) {
+      d.lastSave = Date.now();
+      stickyUpdate(d.id, { x: pos.x, y: pos.y });
+    }
+  });
+  const endDrag = () => {
+    const d = stickyUi.drag;
+    if (!d) return;
+    stickyUi.drag = null;
+    d.el.classList.remove('is-dragging');
+    const pos = d.pos || { x: d.originX, y: d.originY };
+    stickyUpdate(d.id, { x: pos.x, y: pos.y });
+  };
+  layer.addEventListener('pointerup', endDrag);
+  layer.addEventListener('pointercancel', endDrag);
+
+  // 窗口尺寸变化时把越界的便签收回来
+  window.addEventListener('resize', () => {
+    const notes = stickyRead();
+    let changed = false;
+    notes.forEach(n => {
+      const p = stickyClamp(n.x, n.y);
+      if (p.x !== n.x || p.y !== n.y) { n.x = p.x; n.y = p.y; changed = true; }
+    });
+    if (changed) { stickyWrite(notes); stickyRender(); }
+  });
+
+  window.studyhubSticky = {
+    add: stickyAdd,
+    list: stickyRead,
+    pull: stickyPull,
+    rows: () => stickySync.rows.slice(),
+    clear: () => {
+      const ids = stickyRead().map(n => n.id);
+      stickyWrite([]);
+      stickyRender();
+      ids.forEach(stickyQueueDelete);
+    }
+  };
+}
+
+
+/* ===== 时间胶囊（云端 time_capsules 表，未登录时 localStorage 兜底） ===== */
+const CAPSULE_KEY = 'studyhub.timeCapsules';
+const CAPSULE_MAX = 50;
+let capsuleViewId = '';
+const capsuleSync = { rows: [], loaded: false, loading: false };
+
+function capsuleClient() {
+  return cloud.client || window.studyhubClient || null;
+}
+
+function capsuleNormalize(c) {
+  return {
+    id: String(c.id),
+    text: String(c.text == null ? '' : c.text),
+    createdAt: String(c.createdAt || ''),
+    unlockDate: /^\d{4}-\d{2}-\d{2}$/.test(String(c.unlockDate || '')) ? String(c.unlockDate) : todayStr()
+  };
+}
+
+function capsuleLocalRead() {
+  let raw = [];
+  try { raw = JSON.parse(localStorage.getItem(CAPSULE_KEY) || '[]'); } catch (e) { raw = []; }
+  return (Array.isArray(raw) ? raw : [])
+    .filter(c => c && typeof c === 'object' && c.id && c.text)
+    .map(capsuleNormalize)
+    .sort((a, b) => a.unlockDate.localeCompare(b.unlockDate));
+}
+
+function capsuleLocalWrite(list) {
+  try { localStorage.setItem(CAPSULE_KEY, JSON.stringify(list)); } catch (e) { console.warn('[capsule] 本地保存失败', e); }
+}
+
+// 读：登录并拉取过就用云端缓存；否则用 localStorage
+function capsuleRead() {
+  return capsuleSync.loaded ? capsuleSync.rows.slice() : capsuleLocalRead();
+}
+
+function capsuleWrite(list) {
+  if (capsuleSync.loaded) capsuleSync.rows = list.slice();
+  else capsuleLocalWrite(list);
+}
+
+function capsuleRowToItem(r) {
+  return capsuleNormalize({
+    id: r.id,
+    text: r.content,
+    createdAt: r.created_at,
+    unlockDate: String(r.unlock_date || '').slice(0, 10)
+  });
+}
+
+// 云端拉取：本机有、云端没有的，登录后自动迁上去（按内容+解锁日去重）
+async function capsulePull() {
+  const client = capsuleClient();
+  if (!client) return;
+  if (!cloud.user) await ensureCloudUser();
+  const uid = cloud.user && cloud.user.id;
+  if (!uid) return;
+  capsuleSync.loading = true;
+  try {
+    const { data, error } = await client.from('time_capsules')
+      .select('*').eq('user_id', uid).order('unlock_date', { ascending: true });
+    if (error) throw error;
+    const rows = (Array.isArray(data) ? data : []).map(capsuleRowToItem);
+    const local = capsuleLocalRead();
+    const seen = new Set(rows.map(r => r.unlockDate + '|' + r.text));
+
+    const toMigrate = local.filter(l => !seen.has(l.unlockDate + '|' + l.text));
+    for (const c of toMigrate) {
+      try {
+        const { data: saved, error: insErr } = await client.from('time_capsules')
+          .insert({ user_id: uid, content: c.text, unlock_date: c.unlockDate })
+          .select().single();
+        if (insErr) throw insErr;
+        if (saved) rows.push(capsuleRowToItem(saved));
+      } catch (err) {
+        console.warn('[capsule] 迁移失败', err);
+      }
+    }
+    if (toMigrate.length && rows.length) syncToast('本机时间胶囊已迁移到云端 ☁️');
+
+    capsuleSync.rows = rows.sort((a, b) => a.unlockDate.localeCompare(b.unlockDate));
+    capsuleSync.loaded = true;
+    capsuleRender();
+  } catch (err) {
+    console.warn('[capsule] 拉取失败，继续用本机数据', err);
+    const msg = String((err && err.message) || '');
+    if (/does not exist|schema cache/i.test(msg)) {
+      syncError('time_capsules 表还没建好：请先在 Supabase SQL Editor 执行建表 SQL');
+    } else {
+      syncError('时间胶囊读取失败：' + (msg || '请检查网络或 RLS'));
+    }
+  } finally {
+    capsuleSync.loading = false;
+  }
+}
+
+// 退出登录：回到本机模式
+function capsuleResetLocal() {
+  capsuleSync.rows = [];
+  capsuleSync.loaded = false;
+  capsuleRender();
+}
+
+function capsuleDaysLeft(unlockDate) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(unlockDate || ''));
+  if (!m) return 0;
+  const target = new Date(+m[1], +m[2] - 1, +m[3]);
+  return Math.round((target - parseDate(todayStr())) / 86400000);
+}
+
+// 按系统日期判断：到了解锁日（含）即可打开
+function capsuleUnlocked(c) {
+  return todayStr() >= c.unlockDate;
+}
+
+function capsuleMsg(text, ok) {
+  const el = $('capsule-msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
+}
+
+function capsuleRender() {
+  const zone = $('capsule-zone');
+  const list = $('capsule-list');
+  if (!zone || !list) return;
+  const items = capsuleRead();
+  zone.classList.toggle('hidden', !items.length);
+  if (!items.length) { list.innerHTML = ''; return; }
+  list.innerHTML = items.map(c => {
+    const open = capsuleUnlocked(c);
+    const left = capsuleDaysLeft(c.unlockDate);
+    const meta = open
+      ? `已解锁 · ${c.unlockDate}`
+      : `还有 ${left} 天解锁 · ${c.unlockDate}`;
+    return `<button class="capsule-card${open ? ' is-open' : ''}" type="button" data-capsule="${esc(c.id)}"
+        aria-label="${open ? '打开这封已解锁的信' : '这封信还没到解锁日期'}">
+        <span class="capsule-icon" aria-hidden="true">${open ? '✉️' : '🔒'}</span>
+        <span class="capsule-main">
+          <span class="capsule-title">${open ? '解锁的信' : '写给未来的信'}</span>
+          <span class="capsule-meta">${esc(meta)}</span>
+        </span>
+        <span class="capsule-action">${open ? '查看' : '未解锁'}</span>
+      </button>`;
+  }).join('');
+}
+
+function capsuleOpenForm() {
+  const wrap = $('capsule-form-wrap');
+  if (!wrap) return;
+  const show = wrap.classList.contains('hidden');
+  wrap.classList.toggle('hidden', !show);
+  capsuleMsg('');
+  const dateEl = $('capsule-date');
+  if (show && dateEl) {
+    // 用 setAttribute 写 min：部分浏览器对 input.min 属性支持不一致，这里统一用属性设置
+    dateEl.setAttribute('min', addDays(todayStr(), 1));   // 至少明天
+    dateEl.value = addDays(todayStr(), 30);               // 默认 30 天后
+    const ta = $('capsule-text');
+    if (ta) setTimeout(() => { try { ta.focus(); } catch (e) { /* 忽略 */ } }, 60);
+  }
+}
+
+async function capsuleSave() {
+  const text = String(($('capsule-text') || {}).value || '').trim();
+  const unlockDate = String(($('capsule-date') || {}).value || '').trim();
+  if (!text) { capsuleMsg('先写点什么给未来的自己吧'); return; }
+  if (text.length > 500) { capsuleMsg('最多 500 字哦'); return; }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(unlockDate)) { capsuleMsg('请选择解锁日期'); return; }
+  if (unlockDate <= todayStr()) { capsuleMsg('解锁日期要在明天以后'); return; }
+
+  const list = capsuleRead();
+  if (list.length >= CAPSULE_MAX) { capsuleMsg(`最多保存 ${CAPSULE_MAX} 封信`); return; }
+  const saveBtn = $('capsule-save');
+  if (saveBtn && saveBtn.disabled) return;
+
+  const tempId = (window.crypto && typeof crypto.randomUUID === 'function') ? crypto.randomUUID() : uid();
+  const item = { id: tempId, text, createdAt: new Date().toISOString(), unlockDate };
+
+  const client = capsuleClient();
+  let uidNow = null;
+  if (client) {
+    if (!cloud.user) await ensureCloudUser();
+    uidNow = cloud.user && cloud.user.id;
+  }
+
+  if (client && uidNow) {
+    // 云端模式：插入成功后再落本地缓存，失败不丢内容
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '封存中…'; }
+    try {
+      const { data, error } = await client.from('time_capsules')
+        .insert({ user_id: uidNow, content: text, unlock_date: unlockDate })
+        .select().single();
+      if (error) throw error;
+      const saved = data ? capsuleRowToItem(data) : item;
+      capsuleWrite(capsuleRead().concat([saved]).sort((a, b) => a.unlockDate.localeCompare(b.unlockDate)));
+      // 云端模式下拉取过的列表就是真相，同时把本机缓存同步一份，离线也能看到
+      if (capsuleSync.loaded) capsuleLocalWrite(capsuleSync.rows);
+    } catch (err) {
+      console.warn('[capsule] 云端保存失败', err);
+      capsuleMsg('云端保存失败：' + ((err && err.message) || '请检查网络或 RLS'));
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '封存这封信'; }
+      return;
+    } finally {
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '封存这封信'; }
+    }
+  } else {
+    // 未登录：存本机，登录后会自动迁移到云端
+    capsuleWrite(list.concat([item]).sort((a, b) => a.unlockDate.localeCompare(b.unlockDate)));
+  }
+
+  const ta = $('capsule-text');
+  if (ta) ta.value = '';
+  $('capsule-form-wrap').classList.add('hidden');
+  capsuleMsg('');
+  capsuleRender();
+  syncToast(`信已封存，${capsuleDaysLeft(unlockDate)} 天后自动解锁 ✉️`);
+}
+
+function capsuleOpenView(id) {
+  const item = capsuleRead().find(c => c.id === String(id));
+  if (!item) return;
+  if (!capsuleUnlocked(item)) {
+    const left = capsuleDaysLeft(item.unlockDate);
+    syncToast(left > 0 ? `这封信还有 ${left} 天才能打开哦 🔒` : '这封信还没到解锁日期');
+    return;
+  }
+  capsuleViewId = item.id;
+  const modal = $('capsule-view');
+  const textEl = $('capsule-view-text');
+  const metaEl = $('capsule-view-meta');
+  const titleEl = $('capsule-view-title');
+  if (titleEl) titleEl.textContent = '✉️ 解锁的信';
+  if (metaEl) {
+    const created = item.createdAt ? new Date(item.createdAt) : null;
+    const createdText = created && !isNaN(created.getTime())
+      ? `${created.getFullYear()}-${pad(created.getMonth() + 1)}-${pad(created.getDate())}`
+      : '—';
+    metaEl.textContent = `写于 ${createdText} · 解锁于 ${item.unlockDate}`;
+  }
+  if (textEl) textEl.textContent = item.text;
+  if (modal) {
+    modal.classList.remove('hidden');
+    const ok = $('capsule-view-ok');
+    if (ok) try { ok.focus({ preventScroll: true }); } catch (e) { /* 忽略 */ }
+  }
+  void capsuleViewId;
+}
+
+function capsuleCloseView() {
+  const modal = $('capsule-view');
+  if (modal) modal.classList.add('hidden');
+  capsuleViewId = '';
+}
+
+function initCapsules() {
+  const list = $('capsule-list');
+  const openBtn = $('capsule-open');
+  const saveBtn = $('capsule-save');
+  const cancelBtn = $('capsule-cancel');
+  const viewModal = $('capsule-view');
+  if (openBtn) openBtn.addEventListener('click', capsuleOpenForm);
+  if (saveBtn) saveBtn.addEventListener('click', capsuleSave);
+  if (cancelBtn) cancelBtn.addEventListener('click', () => {
+    $('capsule-form-wrap').classList.add('hidden');
+    capsuleMsg('');
+  });
+  if (list) {
+    list.addEventListener('click', e => {
+      const card = e.target.closest('[data-capsule]');
+      if (card) capsuleOpenView(card.dataset.capsule);
+    });
+  }
+  const closeBtn = $('capsule-view-close');
+  const okBtn = $('capsule-view-ok');
+  if (closeBtn) closeBtn.addEventListener('click', capsuleCloseView);
+  if (okBtn) okBtn.addEventListener('click', capsuleCloseView);
+  if (viewModal) viewModal.addEventListener('click', e => { if (e.target === viewModal) capsuleCloseView(); });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (viewModal && !viewModal.classList.contains('hidden')) capsuleCloseView();
+  });
+  capsuleRender();
+}
+
+window.studyhubCapsule = {
+  list: capsuleRead,
+  open: capsuleOpenView,
+  render: capsuleRender,
+  save: capsuleSave,
+  pull: capsulePull,
+  rows: () => capsuleSync.rows.slice()
+};
+
 
 /* ===== 启动 ===== */
 (function init() {
@@ -2907,6 +5016,16 @@ $('week-grid').addEventListener('click', e => {
   renderAll();
   initMoods();
   initPlans();
+  initCustomCountdowns();
+  initHabits();
+  initStudyroom();
+  initWoodfish();
+  initHydrate();
+  initPlant();
+  initSticky();
+  initCapsules();
+  initFortune();
+  initFx();
   save(); // 持久化一次性迁移标记
   initCloud();
   liveUpdate();
